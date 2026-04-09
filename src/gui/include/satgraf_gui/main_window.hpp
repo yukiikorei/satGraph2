@@ -23,6 +23,7 @@
 #include <QLabel>
 #include <QSlider>
 #include <QCheckBox>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFormLayout>
@@ -472,6 +473,7 @@ public slots:
             renderer_->highlight_community(std::nullopt);
             renderer_->highlight_simple2d_community(std::nullopt);
             if (view_3d_) view_3d_->highlightCommunity(std::nullopt);
+            update_neighbor_community_list(0);
             return;
         }
 
@@ -493,8 +495,8 @@ public slots:
             }
         }
 
-        int internal_edge_count = 0;
-        int external_edge_count = 0;
+        double internal_edge_count = 0;
+        double external_edge_count = 0;
         std::set<uint32_t> linked_communities;
 
         for (const auto& [eid, edge] : graph_->getEdges()) {
@@ -510,9 +512,9 @@ public slots:
             bool tgt_in = (tgt_it->second.value == cid);
 
             if (src_in && tgt_in) {
-                internal_edge_count++;
+                internal_edge_count += edge.weight;
             } else if (src_in || tgt_in) {
-                external_edge_count++;
+                external_edge_count += edge.weight;
                 uint32_t other_cid = src_in ? tgt_it->second.value : src_it->second.value;
                 linked_communities.insert(other_cid);
             }
@@ -520,9 +522,10 @@ public slots:
 
         comm_nodes_label_->setText(QString::number(internal_node_count));
         comm_bridge_label_->setText(QString::number(bridge_node_count));
-        comm_internal_edges_label_->setText(QString::number(internal_edge_count));
-        comm_external_edges_label_->setText(QString::number(external_edge_count));
+        comm_internal_edges_label_->setText(QString::number(internal_edge_count, 'f', 1));
+        comm_external_edges_label_->setText(QString::number(external_edge_count, 'f', 1));
         comm_linked_label_->setText(QString::number(static_cast<int>(linked_communities.size())));
+        update_neighbor_community_list(cid);
     }
 
     void on_node_clicked(satgraf::graph::NodeId id) {
@@ -580,9 +583,20 @@ public slots:
             .arg(id.value)
             .arg(QString::fromStdString(node_opt->get().name)));
         node_community_label_->setText(community_str);
+        if (has_community) {
+            QColor bg = rendering::community_color(cid);
+            node_community_label_->setStyleSheet(
+                QString("background-color: rgba(%1,%2,%3,80); padding: 1px 4px; border-radius: 2px;")
+                    .arg(bg.red()).arg(bg.green()).arg(bg.blue()));
+        } else {
+            node_community_label_->setStyleSheet("");
+        }
         node_int_nbr_label_->setText(int_nbr_str);
         node_ext_nbr_label_->setText(ext_nbr_str);
         node_linked_label_->setText(linked_str);
+
+        uint32_t comm_for_clauses = has_community ? cid : UINT32_MAX;
+        update_clause_display(id, comm_for_clauses);
 
         log(QString("Selected node %1, community %2").arg(id.value).arg(community_str));
     }
@@ -914,8 +928,8 @@ private:
         main_splitter->setStretchFactor(2, 1);
         main_splitter->setStretchFactor(3, 0);
 
-        left_panel->setFixedWidth(256);
-        right_panel->setFixedWidth(230);
+        left_panel->setMinimumWidth(200);
+        right_panel->setMinimumWidth(200);
 
         top_layout->addWidget(main_splitter, 1);
 
@@ -938,23 +952,12 @@ private:
 
         layout->addWidget(separator());
 
-        add_form_row(layout, "Community:", [&] {
-            auto* combo = new QComboBox(this);
-            for (const auto& n : community::DetectorFactory::instance().available_algorithms())
-                combo->addItem(QString::fromStdString(n));
-            connect(combo, &QComboBox::currentTextChanged, this, &MainWindow::set_community_method);
-            community_combo_ = combo;
-            return combo;
-        }());
+        auto* mode_grid = new QFormLayout();
+        mode_grid->setSpacing(4);
+        mode_grid->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        mode_grid->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
 
-        add_form_row(layout, "Layout:", [&] {
-            auto* combo = new QComboBox(this);
-            connect(combo, &QComboBox::currentTextChanged, this, &MainWindow::set_layout_algorithm);
-            layout_combo_ = combo;
-            return combo;
-        }());
-
-        add_form_row(layout, "Render Mode:", [&] {
+        mode_grid->addRow("Render Mode:", [&] {
             auto* combo = new QComboBox(this);
             combo->addItem("2D", 0);
             combo->addItem("Simple 2D", 1);
@@ -965,6 +968,24 @@ private:
             render_mode_combo_ = combo;
             return combo;
         }());
+
+        mode_grid->addRow("Layout:", [&] {
+            auto* combo = new QComboBox(this);
+            connect(combo, &QComboBox::currentTextChanged, this, &MainWindow::set_layout_algorithm);
+            layout_combo_ = combo;
+            return combo;
+        }());
+
+        mode_grid->addRow("Community:", [&] {
+            auto* combo = new QComboBox(this);
+            for (const auto& n : community::DetectorFactory::instance().available_algorithms())
+                combo->addItem(QString::fromStdString(n));
+            connect(combo, &QComboBox::currentTextChanged, this, &MainWindow::set_community_method);
+            community_combo_ = combo;
+            return combo;
+        }());
+
+        layout->addLayout(mode_grid);
 
         mode_layout_selection_[0] = "f";
         mode_layout_selection_[1] = "community-fa";
@@ -1155,14 +1176,16 @@ private:
 
         layout->addWidget(separator());
 
-        auto* comm_title = new QLabel("<b>Community</b>", this);
-        layout->addWidget(comm_title);
+        comm_content_ = new QWidget(this);
+        auto* comm_inner = new QVBoxLayout(comm_content_);
+        comm_inner->setContentsMargins(0, 0, 0, 0);
+        comm_inner->setSpacing(4);
 
         community_select_combo_ = new QComboBox(this);
         community_select_combo_->addItem("— none —", 0xFFFFFFFF);
         connect(community_select_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged),
                 this, &MainWindow::on_community_selected);
-        layout->addWidget(community_select_combo_);
+        comm_inner->addWidget(community_select_combo_);
 
         highlight_check_ = new QCheckBox("Highlight", this);
         highlight_check_->setChecked(true);
@@ -1179,7 +1202,7 @@ private:
                 if (view_3d_) view_3d_->highlightCommunity(std::nullopt);
             }
         });
-        layout->addWidget(highlight_check_);
+        comm_inner->addWidget(highlight_check_);
 
         auto* comm_grid = new QFormLayout();
         comm_grid->setSpacing(4);
@@ -1199,19 +1222,39 @@ private:
         comm_grid->addRow("Internal Edges:", comm_internal_edges_label_);
         comm_grid->addRow("External Edges:", comm_external_edges_label_);
         comm_grid->addRow("Linked Communities:", comm_linked_label_);
-        layout->addLayout(comm_grid);
+        comm_inner->addLayout(comm_grid);
+
+        auto* neighbor_label = new QLabel("<b>Neighbors</b>", this);
+        comm_inner->addWidget(neighbor_label);
+
+        auto* neighbor_scroll = new QScrollArea(this);
+        neighbor_scroll->setWidgetResizable(true);
+        neighbor_scroll->setMaximumHeight(120);
+        neighbor_list_container_ = new QWidget(this);
+        neighbor_list_layout_ = new QVBoxLayout(neighbor_list_container_);
+        neighbor_list_layout_->setContentsMargins(0, 0, 0, 0);
+        neighbor_list_layout_->setSpacing(2);
+        neighbor_list_layout_->addStretch();
+        neighbor_scroll->setWidget(neighbor_list_container_);
+        comm_inner->addWidget(neighbor_scroll);
+
+        comm_toggle_ = make_collapsible_section("Community", comm_content_);
+        layout->addWidget(comm_toggle_);
+        layout->addWidget(comm_content_);
 
         layout->addWidget(separator());
 
-        auto* node_title = new QLabel("<b>Selected Node</b>", this);
-        layout->addWidget(node_title);
+        var_content_ = new QWidget(this);
+        auto* var_inner = new QVBoxLayout(var_content_);
+        var_inner->setContentsMargins(0, 0, 0, 0);
+        var_inner->setSpacing(4);
 
         node_search_edit_ = new QLineEdit(this);
         node_search_edit_->setPlaceholderText("Search node by ID...");
         node_search_edit_->setEnabled(false);
         connect(node_search_edit_, &QLineEdit::returnPressed,
                 this, &MainWindow::on_node_search);
-        layout->addWidget(node_search_edit_);
+        var_inner->addWidget(node_search_edit_);
 
         auto* node_grid = new QFormLayout();
         node_grid->setSpacing(4);
@@ -1231,7 +1274,55 @@ private:
         node_grid->addRow("Internal Neighbors:", node_int_nbr_label_);
         node_grid->addRow("External Neighbors:", node_ext_nbr_label_);
         node_grid->addRow("Linked Communities:", node_linked_label_);
-        layout->addLayout(node_grid);
+        var_inner->addLayout(node_grid);
+
+        auto* clause_label = new QLabel("<b>Clauses</b>", this);
+        var_inner->addWidget(clause_label);
+
+        clause_display_ = new QWidget(this);
+        auto* clause_vlayout = new QVBoxLayout(clause_display_);
+        clause_vlayout->setContentsMargins(0, 0, 0, 0);
+        clause_vlayout->setSpacing(8);
+
+        auto* pos_section = new QWidget(this);
+        auto* pos_section_layout = new QVBoxLayout(pos_section);
+        pos_section_layout->setContentsMargins(0, 0, 0, 0);
+        pos_section_layout->setSpacing(2);
+        pos_section_layout->addWidget(new QLabel("<b>Pos Clauses</b>", this));
+        auto* pos_scroll = new QScrollArea(this);
+        pos_scroll->setWidgetResizable(true);
+        pos_scroll->setMaximumHeight(300);
+        auto* pos_inner_widget = new QWidget(this);
+        pos_clause_layout_ = new QVBoxLayout(pos_inner_widget);
+        pos_clause_layout_->setContentsMargins(0, 0, 0, 0);
+        pos_clause_layout_->setSpacing(4);
+        pos_clause_layout_->addStretch();
+        pos_scroll->setWidget(pos_inner_widget);
+        pos_section_layout->addWidget(pos_scroll);
+        clause_vlayout->addWidget(pos_section);
+
+        auto* neg_section = new QWidget(this);
+        auto* neg_section_layout = new QVBoxLayout(neg_section);
+        neg_section_layout->setContentsMargins(0, 0, 0, 0);
+        neg_section_layout->setSpacing(2);
+        neg_section_layout->addWidget(new QLabel("<b>Neg Clauses</b>", this));
+        auto* neg_scroll = new QScrollArea(this);
+        neg_scroll->setWidgetResizable(true);
+        neg_scroll->setMaximumHeight(300);
+        auto* neg_inner_widget = new QWidget(this);
+        neg_clause_layout_ = new QVBoxLayout(neg_inner_widget);
+        neg_clause_layout_->setContentsMargins(0, 0, 0, 0);
+        neg_clause_layout_->setSpacing(4);
+        neg_clause_layout_->addStretch();
+        neg_scroll->setWidget(neg_inner_widget);
+        neg_section_layout->addWidget(neg_scroll);
+        clause_vlayout->addWidget(neg_section);
+
+        var_inner->addWidget(clause_display_);
+
+        var_toggle_ = make_collapsible_section("Variable", var_content_);
+        layout->addWidget(var_toggle_);
+        layout->addWidget(var_content_);
 
         layout->addStretch();
         layout->addWidget(separator());
@@ -1254,6 +1345,168 @@ private:
         auto* lbl = new QLabel(label, this);
         layout->addWidget(lbl);
         layout->addWidget(widget);
+    }
+
+    QToolButton* make_collapsible_section(const QString& title, QWidget* content) {
+        auto* btn = new QToolButton(this);
+        btn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        btn->setArrowType(Qt::DownArrow);
+        btn->setText(title);
+        btn->setCheckable(true);
+        btn->setChecked(false);
+        btn->setStyleSheet("QToolButton { font-weight: bold; border: none; padding: 4px 0; }");
+        btn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        connect(btn, &QToolButton::toggled, this, [btn, content](bool checked) {
+            content->setVisible(!checked);
+            btn->setArrowType(checked ? Qt::RightArrow : Qt::DownArrow);
+        });
+        content->setVisible(true);
+        return btn;
+    }
+
+    void clear_layout(QLayout* layout) {
+        QLayoutItem* item;
+        while ((item = layout->takeAt(0)) != nullptr) {
+            if (item->widget()) item->widget()->deleteLater();
+            if (item->layout()) clear_layout(item->layout());
+            delete item;
+        }
+    }
+
+    void update_neighbor_community_list(uint32_t selected_cid) {
+        if (!neighbor_list_layout_ || !graph_) return;
+
+        clear_layout(neighbor_list_layout_);
+
+        struct NeighborInfo {
+            uint32_t cid;
+            double edge_count;
+        };
+        std::map<uint32_t, double> neighbor_edge_counts;
+
+        for (const auto& [eid, edge] : graph_->getEdges()) {
+            (void)eid;
+            auto src_it = communities_.assignment.find(edge.source);
+            auto tgt_it = communities_.assignment.find(edge.target);
+            if (src_it == communities_.assignment.end() || tgt_it == communities_.assignment.end()) continue;
+            auto src_cid = src_it->second.value;
+            auto tgt_cid = tgt_it->second.value;
+            if (src_cid == tgt_cid) continue;
+            if (src_cid == selected_cid) {
+                neighbor_edge_counts[tgt_cid] += edge.weight;
+            } else if (tgt_cid == selected_cid) {
+                neighbor_edge_counts[src_cid] += edge.weight;
+            }
+        }
+
+        std::vector<NeighborInfo> neighbors;
+        for (const auto& [cid, count] : neighbor_edge_counts) {
+            neighbors.push_back({cid, count});
+        }
+
+        std::sort(neighbors.begin(), neighbors.end(),
+                  [](const auto& a, const auto& b) { return a.edge_count > b.edge_count; });
+
+        if (neighbors.empty()) {
+            auto* lbl = new QLabel("(no neighbors)", neighbor_list_container_);
+            lbl->setAlignment(Qt::AlignCenter);
+            neighbor_list_layout_->addWidget(lbl);
+        } else {
+            for (const auto& n : neighbors) {
+                auto* row = new QWidget(neighbor_list_container_);
+                auto* hl = new QHBoxLayout(row);
+                hl->setContentsMargins(0, 0, 0, 0);
+                hl->setSpacing(6);
+
+                QColor color = rendering::community_color(n.cid);
+                auto* swatch = new QLabel(neighbor_list_container_);
+                QPixmap pix(14, 14);
+                pix.fill(color);
+                swatch->setPixmap(pix);
+                swatch->setFixedSize(14, 14);
+                hl->addWidget(swatch);
+
+                auto* id_lbl = new QLabel(QString("%1").arg(n.cid), neighbor_list_container_);
+                hl->addWidget(id_lbl, 1);
+
+                auto* count_lbl = new QLabel(QString::number(n.edge_count, 'f', 1), neighbor_list_container_);
+                count_lbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+                hl->addWidget(count_lbl);
+
+                neighbor_list_layout_->addWidget(row);
+            }
+        }
+        neighbor_list_layout_->addStretch();
+    }
+
+    void update_clause_display(satgraf::graph::NodeId selected_node, uint32_t selected_community) {
+        if (!pos_clause_layout_ || !neg_clause_layout_ || !graph_) return;
+
+        clear_layout(pos_clause_layout_);
+        clear_layout(neg_clause_layout_);
+
+        std::vector<std::pair<std::reference_wrapper<const graph::Clause>, bool>> pos_clauses, neg_clauses;
+
+        for (const auto& clause : graph_->getClauses()) {
+            auto it = clause.literals().find(selected_node);
+            if (it == clause.literals().end()) continue;
+            if (it->second) {
+                pos_clauses.emplace_back(std::cref(clause), true);
+            } else {
+                neg_clauses.emplace_back(std::cref(clause), false);
+            }
+        }
+
+        auto sort_by_size = [](auto& vec) {
+            std::sort(vec.begin(), vec.end(), [](const auto& a, const auto& b) {
+                return a.first.get().size() < b.first.get().size();
+            });
+        };
+        sort_by_size(pos_clauses);
+        sort_by_size(neg_clauses);
+
+        auto render_column = [&](QVBoxLayout* col_layout, 
+                                  std::vector<std::pair<std::reference_wrapper<const graph::Clause>, bool>>& clauses) {
+            if (clauses.empty()) {
+                col_layout->addWidget(new QLabel("(none)", clause_display_));
+                col_layout->addStretch();
+                return;
+            }
+
+            for (const auto& [clause_ref, polarity] : clauses) {
+                const auto& clause = clause_ref.get();
+
+                auto* row = new QWidget(clause_display_);
+                auto* hl = new QHBoxLayout(row);
+                hl->setContentsMargins(2, 1, 2, 1);
+                hl->setSpacing(2);
+
+                for (const auto& [lit_node, lit_polarity] : clause.literals()) {
+                    QString text = lit_polarity
+                        ? QString("+%1").arg(lit_node.value)
+                        : QString("-%1").arg(lit_node.value);
+                    auto* lit_lbl = new QLabel(text, clause_display_);
+
+                    if (selected_community != UINT32_MAX) {
+                        auto cit = communities_.assignment.find(lit_node);
+                        if (cit != communities_.assignment.end() && cit->second.value != selected_community) {
+                            QColor bg = rendering::community_color(cit->second.value);
+                            lit_lbl->setStyleSheet(
+                                QString("background-color: rgba(%1,%2,%3,80); padding: 1px 3px; border-radius: 2px;")
+                                    .arg(bg.red()).arg(bg.green()).arg(bg.blue()));
+                        }
+                    }
+
+                    hl->addWidget(lit_lbl);
+                }
+                col_layout->addWidget(row);
+            }
+
+            col_layout->addStretch();
+        };
+
+        render_column(pos_clause_layout_, pos_clauses);
+        render_column(neg_clause_layout_, neg_clauses);
     }
 
     void log(const QString& msg) {
@@ -1510,6 +1763,18 @@ private:
     QLabel* node_ext_nbr_label_{nullptr};
     QLabel* node_linked_label_{nullptr};
     QLabel* log_label_{nullptr};
+
+    QToolButton* comm_toggle_{nullptr};
+    QWidget* comm_content_{nullptr};
+    QToolButton* var_toggle_{nullptr};
+    QWidget* var_content_{nullptr};
+
+    QWidget* neighbor_list_container_{nullptr};
+    QVBoxLayout* neighbor_list_layout_{nullptr};
+
+    QWidget* clause_display_{nullptr};
+    QVBoxLayout* pos_clause_layout_{nullptr};
+    QVBoxLayout* neg_clause_layout_{nullptr};
 
     QLabel* stats_nodes_{nullptr};
     QLabel* stats_edges_{nullptr};
