@@ -17,6 +17,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <set>
 #include <vector>
 
 #define CL_TARGET_OPENCL_VERSION 120
@@ -2495,39 +2496,426 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Layout Factory
+// Community-Weighted Layout (2D)
 // ---------------------------------------------------------------------------
+
+class CommunityWeightedLayout : public Layout {
+    int iterations_;
+    double width_;
+    double height_;
+
+    static constexpr double margin_ratio = 0.08;
+
+public:
+    explicit CommunityWeightedLayout(int iterations = 50, double width = 1024.0, double height = 1024.0)
+        : iterations_(iterations), width_(width), height_(height) {}
+
+    CoordinateMap compute(const graph::Graph<graph::Node, graph::Edge>& graph,
+                          ProgressCallback progress = nullptr) override {
+        CoordinateMap coords;
+        if (graph.getNodes().empty()) {
+            if (progress) progress(1.0);
+            return coords;
+        }
+
+        const auto num_nodes = static_cast<double>(graph.getNodes().size());
+        const double margin = std::min(width_, height_) * margin_ratio;
+        const double cx = width_ * 0.5;
+        const double cy = height_ * 0.5;
+
+        // Step 1: Initialize positions on a circle centered at canvas center
+        const double circle_radius = std::min(width_, height_) * 0.35;
+        const double angle_step = 2.0 * M_PI / num_nodes;
+        {
+            double angle = 0.0;
+            for (const auto& [nid, node] : graph.getNodes()) {
+                (void)node;
+                coords[nid] = Coordinate{
+                    cx + circle_radius * std::cos(angle),
+                    cy + circle_radius * std::sin(angle)
+                };
+                angle += angle_step;
+            }
+        }
+
+        // Step 2: Compute ideal spring length
+        const double area = width_ * height_;
+        const double k = std::sqrt(area / num_nodes);
+
+        // Pre-collect node IDs for iteration
+        std::vector<graph::NodeId> node_ids;
+        node_ids.reserve(graph.getNodes().size());
+        for (const auto& [nid, node] : graph.getNodes()) {
+            (void)node;
+            node_ids.push_back(nid);
+        }
+
+        const double max_temp = k * 0.5;
+
+        for (int iter = 0; iter < iterations_; ++iter) {
+            CoordinateMap displacements;
+            for (const auto& nid : node_ids) {
+                displacements[nid] = Coordinate{0.0, 0.0};
+            }
+
+            // Step 3a: Repulsion (all pairs)
+            for (std::size_t i = 0; i < node_ids.size(); ++i) {
+                for (std::size_t j = i + 1; j < node_ids.size(); ++j) {
+                    const auto& nid1 = node_ids[i];
+                    const auto& nid2 = node_ids[j];
+                    double dx = coords[nid1].x - coords[nid2].x;
+                    double dy = coords[nid1].y - coords[nid2].y;
+                    double dist_sq = dx * dx + dy * dy;
+                    if (dist_sq < 1.0) dist_sq = 1.0;
+                    const double dist = std::sqrt(dist_sq);
+                    const double force = (k * k * k) / dist_sq;
+                    const double fx = (dx / dist) * force;
+                    const double fy = (dy / dist) * force;
+                    displacements[nid1].x += fx;
+                    displacements[nid1].y += fy;
+                    displacements[nid2].x -= fx;
+                    displacements[nid2].y -= fy;
+                }
+            }
+
+            // Step 3b: Attraction (connected pairs, weight-based)
+            for (const auto& [eid, edge] : graph.getEdges()) {
+                (void)eid;
+                double dx = coords[edge.source].x - coords[edge.target].x;
+                double dy = coords[edge.source].y - coords[edge.target].y;
+                double dist = std::sqrt(dx * dx + dy * dy);
+                if (dist < 1.0) dist = 1.0;
+                const double weight = edge.weight > 0.0 ? edge.weight : 1.0;
+                // Higher weight → shorter ideal distance
+                const double ideal_dist = k / (1.0 + std::log(weight));
+                // Spring force: proportional to displacement from ideal
+                const double force = (dist - ideal_dist) * (dist - ideal_dist) / k * weight;
+                displacements[edge.source].x -= (dx / dist) * force;
+                displacements[edge.source].y -= (dy / dist) * force;
+                displacements[edge.target].x += (dx / dist) * force;
+                displacements[edge.target].y += (dy / dist) * force;
+            }
+
+            // Step 3c: Gravity toward center
+            for (const auto& nid : node_ids) {
+                double dx = cx - coords[nid].x;
+                double dy = cy - coords[nid].y;
+                double dist = std::sqrt(dx * dx + dy * dy);
+                if (dist > 0.0) {
+                    const double gravity_force = dist * 0.01;
+                    displacements[nid].x += (dx / dist) * gravity_force;
+                    displacements[nid].y += (dy / dist) * gravity_force;
+                }
+            }
+
+            // Step 3d: Apply with quadratic cooling
+            const double t_ratio = static_cast<double>(iter) / static_cast<double>(iterations_);
+            const double temperature = max_temp * (1.0 - t_ratio) * (1.0 - t_ratio);
+            for (const auto& nid : node_ids) {
+                double d = std::sqrt(displacements[nid].x * displacements[nid].x +
+                                      displacements[nid].y * displacements[nid].y);
+                if (d > 0.0) {
+                    const double scale = std::min(d, temperature) / d;
+                    coords[nid].x += displacements[nid].x * scale;
+                    coords[nid].y += displacements[nid].y * scale;
+                    // Clamp to bounds with margin
+                    coords[nid].x = std::max(margin, std::min(width_ - margin, coords[nid].x));
+                    coords[nid].y = std::max(margin, std::min(height_ - margin, coords[nid].y));
+                }
+            }
+
+            if (progress) {
+                const double p = static_cast<double>(iter + 1) / static_cast<double>(iterations_);
+                progress(p);
+            }
+        }
+
+        // Step 4: Final normalization — scale positions to fill canvas
+        double min_x = std::numeric_limits<double>::max();
+        double max_x = std::numeric_limits<double>::lowest();
+        double min_y = std::numeric_limits<double>::max();
+        double max_y = std::numeric_limits<double>::lowest();
+        for (const auto& [nid, c] : coords) {
+            (void)nid;
+            min_x = std::min(min_x, c.x);
+            max_x = std::max(max_x, c.x);
+            min_y = std::min(min_y, c.y);
+            max_y = std::max(max_y, c.y);
+        }
+        const double span_x = std::max(max_x - min_x, 1.0);
+        const double span_y = std::max(max_y - min_y, 1.0);
+        const double scale = std::min((width_ - 2.0 * margin) / span_x,
+                                       (height_ - 2.0 * margin) / span_y);
+        const double new_cx = (min_x + max_x) * 0.5;
+        const double new_cy = (min_y + max_y) * 0.5;
+        for (auto& [nid, c] : coords) {
+            (void)nid;
+            c.x = cx + (c.x - new_cx) * scale;
+            c.y = cy + (c.y - new_cy) * scale;
+            c.x = std::max(margin, std::min(width_ - margin, c.x));
+            c.y = std::max(margin, std::min(height_ - margin, c.y));
+        }
+
+        return coords;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Community-Weighted Layout (3D)
+// ---------------------------------------------------------------------------
+
+class CommunityWeighted3DLayout : public Layout {
+    int iterations_;
+    double w_;
+    double h_;
+    double d_;
+
+    static constexpr double margin_ratio = 0.08;
+
+public:
+    explicit CommunityWeighted3DLayout(int iterations = 50,
+                                       double w = 1024.0,
+                                       double h = 1024.0,
+                                       double d = 1024.0)
+        : iterations_(iterations), w_(w), h_(h), d_(d) {}
+
+    CoordinateMap compute(const graph::Graph<graph::Node, graph::Edge>& graph,
+                          ProgressCallback progress = nullptr) override {
+        auto coords3d = compute3D(graph, progress);
+        CoordinateMap coords2d;
+        for (const auto& [id, c3d] : coords3d) {
+            coords2d.emplace(id, Coordinate{c3d.x, c3d.y});
+        }
+        return coords2d;
+    }
+
+    Coordinate3DMap compute3D(const graph::Graph<graph::Node, graph::Edge>& graph,
+                               ProgressCallback progress = nullptr) {
+        Coordinate3DMap coords;
+        if (graph.getNodes().empty()) {
+            if (progress) progress(1.0);
+            return coords;
+        }
+
+        const auto num_nodes = static_cast<double>(graph.getNodes().size());
+        const double margin = std::min({w_, h_, d_}) * margin_ratio;
+        const double cx = w_ * 0.5;
+        const double cy = h_ * 0.5;
+        const double cz = d_ * 0.5;
+
+        // Step 1: Initialize on a sphere centered at cube center
+        const double sphere_radius = std::min({w_, h_, d_}) * 0.35;
+        const double angle_step = 2.0 * M_PI / num_nodes;
+        const double z_step = M_PI / (num_nodes + 1.0);
+        {
+            int idx = 0;
+            for (const auto& [nid, node] : graph.getNodes()) {
+                (void)node;
+                const double phi = z_step * static_cast<double>(idx + 1);
+                const double theta = angle_step * static_cast<double>(idx);
+                coords[nid] = Coordinate3D{
+                    cx + sphere_radius * std::sin(phi) * std::cos(theta),
+                    cy + sphere_radius * std::sin(phi) * std::sin(theta),
+                    cz + sphere_radius * std::cos(phi)
+                };
+                ++idx;
+            }
+        }
+
+        // Step 2: Compute ideal spring length using volume
+        const double volume = w_ * h_ * d_;
+        const double k = std::cbrt(volume / num_nodes);
+
+        std::vector<graph::NodeId> node_ids;
+        node_ids.reserve(graph.getNodes().size());
+        for (const auto& [nid, node] : graph.getNodes()) {
+            (void)node;
+            node_ids.push_back(nid);
+        }
+
+        const double max_temp = k * 0.5;
+
+        for (int iter = 0; iter < iterations_; ++iter) {
+            Coordinate3DMap displacements;
+            for (const auto& nid : node_ids) {
+                displacements[nid] = Coordinate3D{0.0, 0.0, 0.0};
+            }
+
+            // Step 3a: Repulsion (all pairs, 3D)
+            for (std::size_t i = 0; i < node_ids.size(); ++i) {
+                for (std::size_t j = i + 1; j < node_ids.size(); ++j) {
+                    const auto& nid1 = node_ids[i];
+                    const auto& nid2 = node_ids[j];
+                    double dx = coords[nid1].x - coords[nid2].x;
+                    double dy = coords[nid1].y - coords[nid2].y;
+                    double dz = coords[nid1].z - coords[nid2].z;
+                    double dist_sq = dx * dx + dy * dy + dz * dz;
+                    if (dist_sq < 1.0) dist_sq = 1.0;
+                    const double dist = std::sqrt(dist_sq);
+                    const double force = (k * k * k) / dist_sq;
+                    const double fx = (dx / dist) * force;
+                    const double fy = (dy / dist) * force;
+                    const double fz = (dz / dist) * force;
+                    displacements[nid1].x += fx;
+                    displacements[nid1].y += fy;
+                    displacements[nid1].z += fz;
+                    displacements[nid2].x -= fx;
+                    displacements[nid2].y -= fy;
+                    displacements[nid2].z -= fz;
+                }
+            }
+
+            // Step 3b: Attraction (connected pairs, weight-based, 3D)
+            for (const auto& [eid, edge] : graph.getEdges()) {
+                (void)eid;
+                double dx = coords[edge.source].x - coords[edge.target].x;
+                double dy = coords[edge.source].y - coords[edge.target].y;
+                double dz = coords[edge.source].z - coords[edge.target].z;
+                double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (dist < 1.0) dist = 1.0;
+                const double weight = edge.weight > 0.0 ? edge.weight : 1.0;
+                // Higher weight → shorter ideal distance
+                const double ideal_dist = k / (1.0 + std::log(weight));
+                // Spring force: proportional to displacement from ideal
+                const double force = (dist - ideal_dist) * (dist - ideal_dist) / k * weight;
+                displacements[edge.source].x -= (dx / dist) * force;
+                displacements[edge.source].y -= (dy / dist) * force;
+                displacements[edge.source].z -= (dz / dist) * force;
+                displacements[edge.target].x += (dx / dist) * force;
+                displacements[edge.target].y += (dy / dist) * force;
+                displacements[edge.target].z += (dz / dist) * force;
+            }
+
+            // Step 3c: Gravity toward center
+            for (const auto& nid : node_ids) {
+                double dx = cx - coords[nid].x;
+                double dy = cy - coords[nid].y;
+                double dz = cz - coords[nid].z;
+                double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (dist > 0.0) {
+                    const double gravity_force = dist * 0.01;
+                    displacements[nid].x += (dx / dist) * gravity_force;
+                    displacements[nid].y += (dy / dist) * gravity_force;
+                    displacements[nid].z += (dz / dist) * gravity_force;
+                }
+            }
+
+            // Step 3d: Apply with quadratic cooling
+            const double t_ratio = static_cast<double>(iter) / static_cast<double>(iterations_);
+            const double temperature = max_temp * (1.0 - t_ratio) * (1.0 - t_ratio);
+            for (const auto& nid : node_ids) {
+                double mag = std::sqrt(displacements[nid].x * displacements[nid].x +
+                                        displacements[nid].y * displacements[nid].y +
+                                        displacements[nid].z * displacements[nid].z);
+                if (mag > 0.0) {
+                    const double scale = std::min(mag, temperature) / mag;
+                    coords[nid].x += displacements[nid].x * scale;
+                    coords[nid].y += displacements[nid].y * scale;
+                    coords[nid].z += displacements[nid].z * scale;
+                    coords[nid].x = std::max(margin, std::min(w_ - margin, coords[nid].x));
+                    coords[nid].y = std::max(margin, std::min(h_ - margin, coords[nid].y));
+                    coords[nid].z = std::max(margin, std::min(d_ - margin, coords[nid].z));
+                }
+            }
+
+            if (progress) {
+                const double p = static_cast<double>(iter + 1) / static_cast<double>(iterations_);
+                progress(p);
+            }
+        }
+
+        // Step 4: Final normalization — scale to fill 3D space
+        double min_x = std::numeric_limits<double>::max();
+        double max_x = std::numeric_limits<double>::lowest();
+        double min_y = std::numeric_limits<double>::max();
+        double max_y = std::numeric_limits<double>::lowest();
+        double min_z = std::numeric_limits<double>::max();
+        double max_z = std::numeric_limits<double>::lowest();
+        for (const auto& [nid, c] : coords) {
+            (void)nid;
+            min_x = std::min(min_x, c.x);
+            max_x = std::max(max_x, c.x);
+            min_y = std::min(min_y, c.y);
+            max_y = std::max(max_y, c.y);
+            min_z = std::min(min_z, c.z);
+            max_z = std::max(max_z, c.z);
+        }
+        const double span_x = std::max(max_x - min_x, 1.0);
+        const double span_y = std::max(max_y - min_y, 1.0);
+        const double span_z = std::max(max_z - min_z, 1.0);
+        const double scale = std::min({(w_ - 2.0 * margin) / span_x,
+                                        (h_ - 2.0 * margin) / span_y,
+                                        (d_ - 2.0 * margin) / span_z});
+        const double new_cx = (min_x + max_x) * 0.5;
+        const double new_cy = (min_y + max_y) * 0.5;
+        const double new_cz = (min_z + max_z) * 0.5;
+        for (auto& [nid, c] : coords) {
+            (void)nid;
+            c.x = cx + (c.x - new_cx) * scale;
+            c.y = cy + (c.y - new_cy) * scale;
+            c.z = cz + (c.z - new_cz) * scale;
+            c.x = std::max(margin, std::min(w_ - margin, c.x));
+            c.y = std::max(margin, std::min(h_ - margin, c.y));
+            c.z = std::max(margin, std::min(d_ - margin, c.z));
+        }
+
+        return coords;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Layout Mode & Factory
+// ---------------------------------------------------------------------------
+
+enum class LayoutMode { Detailed2D, Simple2D, Mode3D, Simple3D };
 
 class LayoutFactory {
 public:
     using Creator = std::function<std::unique_ptr<Layout>()>;
+
+    struct LayoutEntry {
+        Creator creator;
+        std::set<LayoutMode> modes;
+    };
 
     static LayoutFactory& instance() {
         static LayoutFactory factory;
         return factory;
     }
 
-    void register_layout(const std::string& name, Creator creator) {
+    void register_layout(const std::string& name, Creator creator, std::set<LayoutMode> modes = {}) {
         const std::lock_guard<std::mutex> lock(mutex_);
-        creators_[name] = std::move(creator);
+        entries_[name] = LayoutEntry{std::move(creator), std::move(modes)};
     }
 
     std::unique_ptr<Layout> create(const std::string& name) const {
         const std::lock_guard<std::mutex> lock(mutex_);
-        auto it = creators_.find(name);
-        if (it == creators_.end()) {
+        auto it = entries_.find(name);
+        if (it == entries_.end()) {
             throw std::runtime_error("Unknown layout: '" + name + "'");
         }
-        return it->second();
+        return it->second.creator();
     }
 
     std::vector<std::string> available_algorithms() const {
         const std::lock_guard<std::mutex> lock(mutex_);
         std::vector<std::string> names;
-        names.reserve(creators_.size());
-        for (const auto& [name, creator] : creators_) {
-            (void)creator;
+        names.reserve(entries_.size());
+        for (const auto& [name, entry] : entries_) {
+            (void)entry;
             names.push_back(name);
+        }
+        std::sort(names.begin(), names.end());
+        return names;
+    }
+
+    std::vector<std::string> available_algorithms(LayoutMode mode) const {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> names;
+        for (const auto& [name, entry] : entries_) {
+            if (entry.modes.empty() || entry.modes.count(mode)) {
+                names.push_back(name);
+            }
         }
         std::sort(names.begin(), names.end());
         return names;
@@ -2535,34 +2923,50 @@ public:
 
 private:
     LayoutFactory() {
-        creators_["f"] = [] {
-            return std::make_unique<FruchtermanReingoldLayout>();
+        entries_["f"] = LayoutEntry{
+            [] { return std::make_unique<FruchtermanReingoldLayout>(); },
+            {LayoutMode::Detailed2D}
         };
-        creators_["fgpu"] = [] {
-            return std::make_unique<GpuFruchtermanReingoldLayout>();
+        entries_["fgpu"] = LayoutEntry{
+            [] { return std::make_unique<GpuFruchtermanReingoldLayout>(); },
+            {LayoutMode::Detailed2D}
         };
-        creators_["forceAtlas2"] = [] {
-            return std::make_unique<ForceAtlas2Layout>();
+        entries_["forceAtlas2"] = LayoutEntry{
+            [] { return std::make_unique<ForceAtlas2Layout>(); },
+            {LayoutMode::Detailed2D}
         };
-        creators_["kk"] = [] {
-            return std::make_unique<KamadaKawaiLayout>();
+        entries_["kk"] = LayoutEntry{
+            [] { return std::make_unique<KamadaKawaiLayout>(); },
+            {LayoutMode::Detailed2D}
         };
-        creators_["c"] = [] {
-            return std::make_unique<CircularLayout>();
+        entries_["c"] = LayoutEntry{
+            [] { return std::make_unique<CircularLayout>(); },
+            {LayoutMode::Detailed2D}
         };
-        creators_["grid"] = [] {
-            return std::make_unique<GridLayout>();
+        entries_["grid"] = LayoutEntry{
+            [] { return std::make_unique<GridLayout>(); },
+            {LayoutMode::Detailed2D}
         };
-        creators_["gkk"] = [] {
-            return std::make_unique<GridKamadaKawaiLayout>();
+        entries_["gkk"] = LayoutEntry{
+            [] { return std::make_unique<GridKamadaKawaiLayout>(); },
+            {LayoutMode::Detailed2D}
         };
-        creators_["fa3d"] = [] {
-            return std::make_unique<ForceAtlas3DLayout>();
+        entries_["fa3d"] = LayoutEntry{
+            [] { return std::make_unique<ForceAtlas3DLayout>(); },
+            {LayoutMode::Mode3D}
+        };
+        entries_["community-fa"] = LayoutEntry{
+            [] { return std::make_unique<CommunityWeightedLayout>(); },
+            {LayoutMode::Simple2D}
+        };
+        entries_["community-fa3d"] = LayoutEntry{
+            [] { return std::make_unique<CommunityWeighted3DLayout>(); },
+            {LayoutMode::Simple3D}
         };
     }
 
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, Creator> creators_;
+    std::map<std::string, LayoutEntry> entries_;
 };
 
 }

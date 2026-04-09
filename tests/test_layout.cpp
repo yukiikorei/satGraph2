@@ -135,6 +135,39 @@ double distance_between(const Coordinate& a, const Coordinate& b) {
     return std::sqrt(dx * dx + dy * dy);
 }
 
+double distance_3d_between(const Coordinate3D& a, const Coordinate3D& b) {
+    const double dx = a.x - b.x;
+    const double dy = a.y - b.y;
+    const double dz = a.z - b.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+Graph<Node, Edge> make_quotient_weighted_graph() {
+    Graph<Node, Edge> graph;
+    for (uint32_t i = 0; i < 5; ++i) {
+        graph.createNode(NodeId{i}, "q" + std::to_string(i));
+    }
+
+    const struct { uint32_t src; uint32_t tgt; double weight; } edges[] = {
+        {0, 1, 10.0},
+        {1, 2,  8.0},
+        {0, 2,  5.0},
+        {2, 3,  3.0},
+        {3, 4, 10.0},
+        {1, 3,  1.0},
+        {0, 4,  0.5},
+        {2, 4,  2.0},
+    };
+
+    for (const auto& [src, tgt, w] : edges) {
+        auto& edge = graph.createEdge(NodeId{src}, NodeId{tgt});
+        edge.weight = w;
+        graph.connect(edge.id, NodeId{src});
+    }
+
+    return graph;
+}
+
 std::unordered_map<NodeId, CommunityId> make_three_community_assignment() {
     return {
         {NodeId{0}, CommunityId{0}},
@@ -676,4 +709,78 @@ TEST_CASE("fa3d is registered in factory", "[layout][factory]") {
     auto layout = LayoutFactory::instance().create("fa3d");
     REQUIRE(layout != nullptr);
     REQUIRE(dynamic_cast<ForceAtlas3DLayout*>(layout.get()) != nullptr);
+}
+
+TEST_CASE("CommunityWeightedLayout produces valid coordinates",
+          "[layout][community-weighted]") {
+    CommunityWeightedLayout layout{50};
+    const auto graph = make_quotient_weighted_graph();
+
+    const auto coordinates = layout.compute(graph);
+
+    REQUIRE(coordinates.size() == 5);
+
+    for (const auto& [node_id, coord] : coordinates) {
+        (void)node_id;
+        REQUIRE(std::isfinite(coord.x));
+        REQUIRE(std::isfinite(coord.y));
+        REQUIRE_FALSE(coord.x == 0.0 && coord.y == 0.0);
+    }
+
+    std::set<std::pair<long long, long long>> unique_positions;
+    for (const auto& [node_id, coord] : coordinates) {
+        (void)node_id;
+        unique_positions.emplace(
+            static_cast<long long>(std::llround(coord.x * 1000.0)),
+            static_cast<long long>(std::llround(coord.y * 1000.0)));
+    }
+    REQUIRE(unique_positions.size() == 5);
+
+    // Edge 0-1 weight=10.0 vs edge 0-4 weight=0.5
+    const double heavy_distance =
+        distance_between(coordinates.at(NodeId{0}), coordinates.at(NodeId{1}));
+    const double light_distance =
+        distance_between(coordinates.at(NodeId{0}), coordinates.at(NodeId{4}));
+    REQUIRE(heavy_distance < light_distance);
+}
+
+TEST_CASE("CommunityWeighted3DLayout produces valid 3D coordinates",
+          "[layout][community-weighted-3d]") {
+    CommunityWeighted3DLayout layout{50};
+    const auto graph = make_quotient_weighted_graph();
+
+    const auto coords3d = layout.compute3D(graph);
+
+    // Every node has an entry
+    REQUIRE(coords3d.size() == 5);
+
+    // All coordinates are finite in every component
+    for (const auto& [node_id, c3d] : coords3d) {
+        (void)node_id;
+        REQUIRE(std::isfinite(c3d.x));
+        REQUIRE(std::isfinite(c3d.y));
+        REQUIRE(std::isfinite(c3d.z));
+    }
+
+    // No two coordinates are identical
+    std::set<std::tuple<long long, long long, long long>> unique_positions;
+    for (const auto& [node_id, c3d] : coords3d) {
+        (void)node_id;
+        unique_positions.emplace(
+            static_cast<long long>(std::llround(c3d.x * 1000.0)),
+            static_cast<long long>(std::llround(c3d.y * 1000.0)),
+            static_cast<long long>(std::llround(c3d.z * 1000.0)));
+    }
+    REQUIRE(unique_positions.size() == 5);
+
+    // z-coordinates are not all zero (3D spread)
+    bool any_nonzero_z = false;
+    for (const auto& [node_id, c3d] : coords3d) {
+        (void)node_id;
+        if (c3d.z != 0.0) {
+            any_nonzero_z = true;
+            break;
+        }
+    }
+    REQUIRE(any_nonzero_z);
 }

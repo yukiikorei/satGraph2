@@ -9,6 +9,7 @@
 
 #include <QApplication>
 #include <QImage>
+#include <QIcon>
 #include <QTimer>
 
 #include <filesystem>
@@ -124,6 +125,7 @@ int main(int argc, char** argv) {
     }
 
     QApplication qt_app(argc, argv);
+    qt_app.setWindowIcon(QIcon(":/satgraf/icon.png"));
     qRegisterMetaType<satgraf::community::CommunityResult>("satgraf::community::CommunityResult");
     qRegisterMetaType<satgraf::layout::CoordinateMap>("satgraf::layout::CoordinateMap");
     satgraf::gui::MainWindow window;

@@ -623,7 +623,8 @@ public:
         const std::unordered_map<uint32_t, QColor>& community_colors,
         double node_size,
         double avg_community_size,
-        double edge_width = 1.0)
+        double edge_width = 1.0,
+        bool show_labels = true)
     {
         scene_->clear();
         node_items_.clear();
@@ -631,6 +632,8 @@ public:
         community_regions_.clear();
         decision_highlight_ = nullptr;
         stored_graph_ = nullptr;
+        simple2d_nodes_.clear();
+        simple2d_edges_.clear();
 
         for (const auto& [pair, weight] : inter_community_edges) {
             QPointF from, to;
@@ -647,30 +650,32 @@ public:
             }
             if (!found_from || !found_to) continue;
 
-            double pen_width = edge_width * std::max(1.0, std::log(weight + 1.0) * 2.0);
+            double pen_width = std::log2(weight) + edge_width;
             auto* line = new QGraphicsLineItem(from.x(), from.y(), to.x(), to.y());
             QPen pen(QBrush(QColor(180, 180, 180, 160)), pen_width);
             line->setPen(pen);
             line->setZValue(0.0);
             scene_->addItem(line);
+            simple2d_edges_.push_back({pair.first, pair.second, line, pen});
 
-            QPointF mid = (from + to) / 2.0;
-            auto* weight_label = new QGraphicsTextItem(
-                QString::number(static_cast<int>(weight)));
-            weight_label->setPos(mid);
-            QFont f;
-            f.setPointSize(8);
-            weight_label->setFont(f);
-            weight_label->setDefaultTextColor(QColor(200, 200, 200));
-            weight_label->setZValue(0.5);
-            scene_->addItem(weight_label);
+            if (show_labels) {
+                QPointF mid = (from + to) / 2.0;
+                auto* weight_label = new QGraphicsTextItem(
+                    QString::number(static_cast<int>(weight)));
+                weight_label->setPos(mid);
+                QFont f;
+                f.setPointSize(8);
+                weight_label->setFont(f);
+                weight_label->setDefaultTextColor(QColor(200, 200, 200));
+                weight_label->setZValue(0.5);
+                scene_->addItem(weight_label);
+            }
         }
 
         for (size_t i = 0; i < community_ids.size(); ++i) {
             uint32_t cid = community_ids[i];
             QPointF center(centers[i].x, centers[i].y);
-            double diameter = node_size * 2.0
-                * std::sqrt(static_cast<double>(community_sizes[i]) / avg_community_size);
+            double diameter = (std::log2(static_cast<double>(community_sizes[i])) + node_size) * 2.0;
 
             auto color_it = community_colors.find(cid);
             QColor color = (color_it != community_colors.end())
@@ -680,16 +685,92 @@ public:
                 cid, center, diameter, color, community_click_callback_);
             scene_->addItem(ellipse);
 
-            auto* label = new QGraphicsTextItem(
-                QString("C%1\n%2 nodes").arg(cid).arg(community_sizes[i]));
-            label->setPos(center.x() + diameter / 2.0 + 4, center.y() - 12);
-            label->setZValue(2.0);
-            QFont f;
-            f.setPointSize(9);
-            f.setBold(true);
-            label->setFont(f);
-            label->setDefaultTextColor(QColor(220, 220, 220));
-            scene_->addItem(label);
+            QGraphicsTextItem* label_item = nullptr;
+            if (show_labels) {
+                auto* label = new QGraphicsTextItem(
+                    QString("C%1\n%2 nodes").arg(cid).arg(community_sizes[i]));
+                label->setPos(center.x() + diameter / 2.0 + 4, center.y() - 12);
+                label->setZValue(2.0);
+                QFont f;
+                f.setPointSize(9);
+                f.setBold(true);
+                label->setFont(f);
+                label->setDefaultTextColor(QColor(220, 220, 220));
+                scene_->addItem(label);
+                label_item = label;
+            }
+            simple2d_nodes_[cid] = {ellipse, label_item};
+        }
+    }
+
+    void highlight_simple2d_community(std::optional<uint32_t> cid) {
+        if (simple2d_nodes_.empty()) return;
+
+        if (!cid) {
+            for (auto& [id, node] : simple2d_nodes_) {
+                (void)id;
+                node.ellipse->setZValue(1.0);
+                node.ellipse->setOpacity(1.0);
+                if (node.label) {
+                    node.label->setZValue(2.0);
+                    node.label->setOpacity(1.0);
+                }
+            }
+            for (auto& e : simple2d_edges_) {
+                e.line->setPen(e.original_pen);
+                e.line->setZValue(0.0);
+                e.line->setOpacity(1.0);
+            }
+            return;
+        }
+
+        std::set<uint32_t> neighbors;
+        for (const auto& e : simple2d_edges_) {
+            if (e.source == *cid) neighbors.insert(e.target);
+            if (e.target == *cid) neighbors.insert(e.source);
+        }
+
+        for (auto& [id, node] : simple2d_nodes_) {
+            if (id == *cid) {
+                node.ellipse->setZValue(3.0);
+                node.ellipse->setOpacity(1.0);
+                if (node.label) {
+                    node.label->setZValue(4.0);
+                    node.label->setOpacity(1.0);
+                }
+            } else if (neighbors.count(id)) {
+                node.ellipse->setZValue(2.5);
+                node.ellipse->setOpacity(1.0);
+                if (node.label) {
+                    node.label->setZValue(3.5);
+                    node.label->setOpacity(1.0);
+                }
+            } else {
+                node.ellipse->setZValue(0.5);
+                node.ellipse->setOpacity(0.3);
+                if (node.label) {
+                    node.label->setZValue(0.4);
+                    node.label->setOpacity(0.3);
+                }
+            }
+        }
+
+        for (auto& e : simple2d_edges_) {
+            bool connected = (e.source == *cid || e.target == *cid);
+            if (connected) {
+                e.line->setZValue(2.0);
+                e.line->setOpacity(1.0);
+                QPen p = e.original_pen;
+                QColor c = p.color();
+                c.setAlpha(255);
+                p.setColor(c);
+                p.setWidthF(p.widthF() * 1.5);
+                e.line->setPen(p);
+            } else {
+                e.line->setPen(e.original_pen);
+                e.line->setZValue(0.0);
+                e.line->setOpacity(0.15);
+            }
         }
     }
 
@@ -701,6 +782,19 @@ private:
     DecisionHighlightItem* decision_highlight_{nullptr};
     const Graph* stored_graph_{nullptr};
     std::function<void(uint32_t)> community_click_callback_;
+
+    struct Simple2DEdge {
+        uint32_t source;
+        uint32_t target;
+        QGraphicsLineItem* line;
+        QPen original_pen;
+    };
+    struct Simple2DNode {
+        CommunityEllipseItem* ellipse;
+        QGraphicsTextItem* label;
+    };
+    std::unordered_map<uint32_t, Simple2DNode> simple2d_nodes_;
+    std::vector<Simple2DEdge> simple2d_edges_;
 };
 
 }  // namespace satgraf::rendering

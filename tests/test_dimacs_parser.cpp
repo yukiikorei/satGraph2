@@ -36,9 +36,7 @@ double find_edge_weight(const satgraf::graph::Graph<satgraf::graph::Node,
                         uint32_t a, uint32_t b) {
     const auto key = std::minmax(a, b);
     for (const auto& [eid, edge] : g.getEdges()) {
-        const auto ek = std::minmax(
-            static_cast<uint32_t>(edge.source),
-            static_cast<uint32_t>(edge.target));
+        const auto ek = std::minmax(edge.source.value, edge.target.value);
         if (ek == key) return edge.weight;
     }
     return 0.0;

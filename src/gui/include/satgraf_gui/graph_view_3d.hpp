@@ -62,13 +62,15 @@ public:
         const std::unordered_map<uint32_t, QColor>& community_colors,
         float node_size = 10.0f,
         double avg_community_size = 1.0,
-        float edge_width = 1.0f)
+        float edge_width = 1.0f,
+        bool show_labels = true)
     {
         communities_.clear();
         edges_.clear();
         full_graph_edges_.clear();
         full_graph_mode_ = false;
         edge_width_ = edge_width;
+        show_labels_ = show_labels;
 
         if (positions.empty()) {
             update();
@@ -112,8 +114,7 @@ public:
                 static_cast<float>((coord.x - center_x) / max_span * 10.0),
                 static_cast<float>((coord.y - center_y) / max_span * 10.0),
                 static_cast<float>((coord.z - center_z) / max_span * 10.0));
-            node.radius = 0.03f * node_size
-                * std::cbrt(static_cast<float>(count) / static_cast<float>(avg_community_size));
+            node.radius = 0.03f * (std::log2(static_cast<float>(count)) + node_size);
             node.community_id = cid;
             node.node_count = count;
 
@@ -370,6 +371,28 @@ protected:
         }
     }
 
+    void paintEvent(QPaintEvent* event) override {
+        QOpenGLWidget::paintEvent(event);
+
+        if (full_graph_mode_ || simple3d_labels_.empty()) return;
+
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::TextAntialiasing);
+        painter.setFont(label_font_);
+
+        for (const auto& lbl : simple3d_labels_) {
+            const QFontMetrics fm(painter.font());
+            QRectF bounds = fm.boundingRect(
+                QRect(0, 0, 200, 100),
+                Qt::AlignCenter | Qt::TextDontClip, lbl.text);
+            bounds.moveCenter(lbl.screen_pos.toPoint());
+
+            painter.fillRect(bounds.adjusted(-4, -2, 4, 2), QColor(30, 30, 30, 220));
+            painter.setPen(lbl.color);
+            painter.drawText(bounds, Qt::AlignCenter | Qt::TextDontClip, lbl.text);
+        }
+    }
+
     void paintFullGraph() {
         glClearColor(background_color_.redF(), background_color_.greenF(),
                      background_color_.blueF(), 1.0f);
@@ -485,16 +508,7 @@ protected:
     }
 
     void paintSimple3D() {
-        struct LabelData {
-            QPointF screen_pos;
-            QString text;
-            QColor color;
-        };
-        std::vector<LabelData> labels;
-        labels.reserve(communities_.size());
-
-        QPainter painter(this);
-        painter.beginNativePainting();
+        simple3d_labels_.clear();
 
         glClearColor(background_color_.redF(), background_color_.greenF(),
                      background_color_.blueF(), 1.0f);
@@ -513,7 +527,6 @@ protected:
         const qreal dpr = devicePixelRatio();
         glViewport(0, 0, static_cast<int>(width() * dpr), static_cast<int>(height() * dpr));
 
-        // Re-upload light state
         const GLfloat lpos[] = {5.0f, 5.0f, 10.0f, 1.0f};
         const GLfloat lamb[] = {0.2f, 0.2f, 0.2f, 1.0f};
         const GLfloat ldif[] = {0.8f, 0.8f, 0.8f, 1.0f};
@@ -521,11 +534,9 @@ protected:
         glLightfv(GL_LIGHT0, GL_AMBIENT, lamb);
         glLightfv(GL_LIGHT0, GL_DIFFUSE, ldif);
 
-        // Projection matrix
         glMatrixMode(GL_PROJECTION);
         glLoadMatrixf(projection_matrix_.constData());
 
-        // Modelview matrix: pull camera back, then rotate
         modelview_matrix_.setToIdentity();
         modelview_matrix_.translate(0.0f, 0.0f, -camera_distance_);
         modelview_matrix_.rotate(rotation_x_, 1.0f, 0.0f, 0.0f);
@@ -535,9 +546,6 @@ protected:
 
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
 
-        // ---------------------------------------------------------------
-        // 10.4 — Draw inter-community edges as thick lines
-        // ---------------------------------------------------------------
         glDisable(GL_LIGHTING);
         for (const auto& edge : edges_) {
             QVector3D src_pos;
@@ -558,8 +566,7 @@ protected:
 
             if (!found_src || !found_tgt) continue;
 
-            const float line_w = edge_width_ * (1.0f + std::log(
-                static_cast<float>(edge.weight) + 1.0f) * 0.5f);
+            const float line_w = std::log2(static_cast<float>(edge.weight)) + edge_width_;
             glLineWidth(std::max(line_w, 1.0f));
             glColor4f(0.8f, 0.8f, 0.8f, 0.6f);
 
@@ -570,39 +577,27 @@ protected:
         }
         glEnable(GL_LIGHTING);
 
-        // ---------------------------------------------------------------
-        // 10.3 — Draw community spheres
-        // ---------------------------------------------------------------
         for (const auto& comm : communities_) {
             drawSphere(comm.position, comm.radius, comm.color);
         }
 
-        for (const auto& comm : communities_) {
-            const QVector3D label_world = comm.position +
-                QVector3D(0.0f, comm.radius + 0.3f, 0.0f);
-            const QVector3D screen = worldToScreen(label_world);
+        if (show_labels_) {
+            for (const auto& comm : communities_) {
+                const QVector3D label_world = comm.position +
+                    QVector3D(0.0f, comm.radius + 0.3f, 0.0f);
+                const QVector3D screen = worldToScreen(label_world);
 
-            if (screen.z() >= 0.0f && screen.z() <= 1.0f) {
-                LabelData lbl;
-                lbl.screen_pos = QPointF(screen.x(), screen.y());
-                lbl.text = QString("C%1\n%2 nodes")
-                    .arg(comm.community_id)
-                    .arg(comm.node_count);
-                lbl.color = QColor(255, 255, 255);
-                labels.push_back(std::move(lbl));
+                if (screen.z() >= 0.0f && screen.z() <= 1.0f) {
+                    simple3d_labels_.push_back({
+                        QPointF(screen.x(), screen.y()),
+                        QString("C%1\n%2 nodes").arg(comm.community_id).arg(comm.node_count),
+                        QColor(255, 255, 255)
+                    });
+                }
             }
         }
 
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-
-        painter.endNativePainting();
-
-        painter.setRenderHint(QPainter::TextAntialiasing);
-        painter.setFont(label_font_);
-
-        for (const auto& lbl : labels) {
-            drawTextBillboard(painter, lbl.screen_pos, lbl.text, lbl.color);
-        }
     }
 
 private:
@@ -645,6 +640,7 @@ private:
     std::vector<FullGraphEdge3D> full_graph_edges_;
     bool full_graph_mode_{false};
     float edge_width_{1.0f};
+    bool show_labels_{true};
     std::optional<uint32_t> highlighted_community_{};
     QColor background_color_{0, 0, 0};
 
@@ -652,6 +648,13 @@ private:
     QMatrix4x4 modelview_matrix_;
 
     QFont label_font_;
+
+    struct Simple3DLabel {
+        QPointF screen_pos;
+        QString text;
+        QColor color;
+    };
+    std::vector<Simple3DLabel> simple3d_labels_;
 
     // Sphere display list handle
     GLuint sphere_list_{0};
@@ -755,24 +758,6 @@ private:
         (void)radius;
         (void)color;
         (void)segments;
-    }
-
-    // -------------------------------------------------------------------
-    // 10.5 — Billboard text label drawing (QPainter 2D overlay)
-    // -------------------------------------------------------------------
-    void drawTextBillboard(QPainter& painter, const QPointF& screen_pos,
-                           const QString& text, const QColor& color)
-    {
-        const QFontMetrics fm(painter.font());
-        QRectF bounds = fm.boundingRect(
-            QRect(0, 0, 200, 100),
-            Qt::AlignCenter | Qt::TextDontClip, text);
-        bounds.moveCenter(screen_pos.toPoint());
-
-        // Semi-transparent background for readability
-        painter.fillRect(bounds.adjusted(-4, -2, 4, 2), QColor(0, 0, 0, 160));
-        painter.setPen(color);
-        painter.drawText(bounds, Qt::AlignCenter | Qt::TextDontClip, text);
     }
 
     // -------------------------------------------------------------------
