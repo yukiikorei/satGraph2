@@ -307,6 +307,27 @@ inline double compute_modularity(
     return (2.0 * sum_intra - sum_expected / two_m) / two_m;
 }
 
+inline std::unordered_set<graph::NodeId> compute_bridge_nodes(
+    const CommunityResult& result,
+    const graph::Graph<graph::Node, graph::Edge>& graph)
+{
+    std::unordered_set<graph::NodeId> bridge;
+    for (const auto& [eid, edge] : graph.getEdges()) {
+        (void)eid;
+        auto src_it = result.assignment.find(edge.source);
+        auto tgt_it = result.assignment.find(edge.target);
+        if (src_it == result.assignment.end() ||
+            tgt_it == result.assignment.end()) {
+            continue;
+        }
+        if (src_it->second != tgt_it->second) {
+            bridge.insert(edge.source);
+            bridge.insert(edge.target);
+        }
+    }
+    return bridge;
+}
+
 }  // namespace detail
 
 class CNMDetector : public Detector {

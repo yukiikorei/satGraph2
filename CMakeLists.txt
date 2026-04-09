@@ -7,7 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # --- Dependencies ---
 find_package(igraph REQUIRED)
-find_package(Qt6 COMPONENTS Core Gui Widgets Qml Quick REQUIRED)
+find_package(Qt6 COMPONENTS Core Gui Widgets Qml Quick OpenGL OpenGLWidgets REQUIRED)
 find_package(OpenCL REQUIRED)
 find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(nlohmann_json CONFIG REQUIRED)

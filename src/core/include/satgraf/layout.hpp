@@ -29,6 +29,13 @@ struct Coordinate {
     double y{0.0};
 };
 
+struct Coordinate3D {
+    double x{0.0};
+    double y{0.0};
+    double z{0.0};
+};
+using Coordinate3DMap = std::unordered_map<graph::NodeId, Coordinate3D>;
+
 using CoordinateMap = std::unordered_map<graph::NodeId, Coordinate>;
 using ProgressCallback = std::function<void(double)>;
 
@@ -1054,6 +1061,390 @@ private:
     double margin_;
 };
 
+class ForceAtlas3DLayout : public Layout {
+public:
+    explicit ForceAtlas3DLayout(std::size_t iterations = 200,
+                                double width = 1024.0,
+                                double height = 1024.0,
+                                double depth = 1024.0,
+                                double margin = 0.0,
+                                double scaling_ratio = 10.0,
+                                double gravity = 1.0,
+                                bool lin_log_mode = false,
+                                double edge_weight_influence = 1.0,
+                                std::size_t thread_count = default_thread_count())
+        : iterations_(iterations)
+        , width_(width)
+        , height_(height)
+        , depth_(depth)
+        , margin_(margin)
+        , scaling_ratio_(scaling_ratio)
+        , gravity_(gravity)
+        , lin_log_mode_(lin_log_mode)
+        , edge_weight_influence_(edge_weight_influence)
+        , thread_count_(thread_count) {}
+
+    Coordinate3DMap compute3D(const graph::Graph<graph::Node, graph::Edge>& input_graph,
+                               ProgressCallback progress_callback = nullptr) {
+        Coordinate3DMap coordinates;
+        const auto& nodes = input_graph.getNodes();
+        if (nodes.empty()) {
+            if (progress_callback) {
+                progress_callback(1.0);
+            }
+            return coordinates;
+        }
+
+        std::vector<graph::NodeId> node_ids;
+        node_ids.reserve(nodes.size());
+        for (const auto& [node_id, node] : nodes) {
+            (void)node;
+            node_ids.push_back(node_id);
+        }
+        std::sort(node_ids.begin(), node_ids.end());
+
+        if (progress_callback) {
+            progress_callback(0.0);
+        }
+
+        if (node_ids.size() == 1) {
+            coordinates.emplace(node_ids.front(),
+                                Coordinate3D{width_ * 0.5, height_ * 0.5, depth_ * 0.5});
+            if (progress_callback) {
+                progress_callback(1.0);
+            }
+            return coordinates;
+        }
+
+        std::unordered_map<graph::NodeId, std::size_t> node_index;
+        for (std::size_t i = 0; i < node_ids.size(); ++i) {
+            node_index.emplace(node_ids[i], i);
+        }
+
+        std::vector<Coordinate3D> positions(node_ids.size());
+        initialize_positions_3d(positions, width_, height_, depth_);
+
+        std::vector<LayoutData3D> layout_data(node_ids.size());
+        const std::size_t effective_iterations = std::max<std::size_t>(iterations_, 1);
+        const auto& edges = input_graph.getEdges();
+        double speed = 1.0;
+
+        for (std::size_t iteration = 0; iteration < effective_iterations; ++iteration) {
+            std::vector<Coordinate3D> displacements(node_ids.size(), Coordinate3D{});
+
+            parallel_for_3d(node_ids.size(),
+                [&](std::size_t begin, std::size_t end, std::vector<Coordinate3D>& local) {
+                    for (std::size_t i = begin; i < end; ++i) {
+                        for (std::size_t j = 0; j < positions.size(); ++j) {
+                            if (i == j) {
+                                continue;
+                            }
+                            apply_pairwise_repulsion_3d(i, j, positions, scaling_ratio_, local);
+                        }
+
+                        const double dx = positions[i].x - width_ * 0.5;
+                        const double dy = positions[i].y - height_ * 0.5;
+                        const double dz = positions[i].z - depth_ * 0.5;
+                        local[i].x -= dx * gravity_ * 0.01;
+                        local[i].y -= dy * gravity_ * 0.01;
+                        local[i].z -= dz * gravity_ * 0.01;
+                    }
+                }, displacements);
+
+            parallel_for_edges_3d(edges, node_index,
+                [&](const std::vector<const graph::Edge*>& chunk,
+                    std::vector<Coordinate3D>& local) {
+                    for (const auto* edge : chunk) {
+                        const auto src_it = node_index.find(edge->source);
+                        const auto tgt_it = node_index.find(edge->target);
+                        if (src_it == node_index.end() || tgt_it == node_index.end()) {
+                            continue;
+                        }
+                        apply_attraction_3d(src_it->second, tgt_it->second,
+                                            *edge, positions, local);
+                    }
+                }, displacements);
+
+            double global_swinging = 0.0;
+            double global_traction = 0.0;
+            for (std::size_t i = 0; i < positions.size(); ++i) {
+                const double swing_x = displacements[i].x - layout_data[i].old_dx;
+                const double swing_y = displacements[i].y - layout_data[i].old_dy;
+                const double swing_z = displacements[i].z - layout_data[i].old_dz;
+                const double tract_x = displacements[i].x + layout_data[i].old_dx;
+                const double tract_y = displacements[i].y + layout_data[i].old_dy;
+                const double tract_z = displacements[i].z + layout_data[i].old_dz;
+                const double swinging = std::sqrt(swing_x * swing_x +
+                                                  swing_y * swing_y +
+                                                  swing_z * swing_z);
+                const double traction = std::sqrt(tract_x * tract_x +
+                                                  tract_y * tract_y +
+                                                  tract_z * tract_z) * 0.5;
+                layout_data[i].swinging = swinging;
+                layout_data[i].traction = traction;
+                global_swinging += swinging;
+                global_traction += traction;
+            }
+
+            const double target_speed = global_swinging <= min_distance()
+                ? speed
+                : std::max((global_traction + min_distance()) /
+                           (global_swinging + min_distance()), 0.01);
+            if (target_speed > speed) {
+                speed += std::min(target_speed - speed, speed * 0.5);
+            } else {
+                speed = target_speed;
+            }
+            speed = std::max(speed, 0.01);
+
+            for (std::size_t i = 0; i < positions.size(); ++i) {
+                const double factor = speed / (1.0 + speed *
+                    std::sqrt(layout_data[i].swinging + min_distance()));
+                positions[i].x += displacements[i].x * factor;
+                positions[i].y += displacements[i].y * factor;
+                positions[i].z += displacements[i].z * factor;
+                layout_data[i].old_dx = displacements[i].x;
+                layout_data[i].old_dy = displacements[i].y;
+                layout_data[i].old_dz = displacements[i].z;
+            }
+
+            const double progress = static_cast<double>(iteration + 1) /
+                                    static_cast<double>(effective_iterations);
+            if (progress_callback) {
+                progress_callback(progress);
+            }
+        }
+
+        rescale_positions_3d(positions,
+                             margin_, std::max(width_ - margin_, margin_),
+                             margin_, std::max(height_ - margin_, margin_),
+                             margin_, std::max(depth_ - margin_, margin_));
+
+        for (std::size_t i = 0; i < node_ids.size(); ++i) {
+            coordinates.emplace(node_ids[i], positions[i]);
+        }
+
+        if (progress_callback) {
+            progress_callback(1.0);
+        }
+
+        return coordinates;
+    }
+
+    CoordinateMap compute(const graph::Graph<graph::Node, graph::Edge>& input_graph,
+                          ProgressCallback progress_callback = nullptr) override {
+        auto coords3d = compute3D(input_graph, progress_callback);
+        CoordinateMap coords2d;
+        for (const auto& [id, c3d] : coords3d) {
+            coords2d.emplace(id, Coordinate{c3d.x, c3d.y});
+        }
+        return coords2d;
+    }
+
+private:
+    struct LayoutData3D {
+        double old_dx{0.0};
+        double old_dy{0.0};
+        double old_dz{0.0};
+        double swinging{0.0};
+        double traction{0.0};
+    };
+
+    static double min_distance() noexcept { return 1e-9; }
+
+    static std::size_t default_thread_count() {
+        const auto hc = std::thread::hardware_concurrency();
+        return std::max<std::size_t>(1, hc == 0 ? 2 : hc);
+    }
+
+    static void initialize_positions_3d(std::vector<Coordinate3D>& positions,
+                                         double width, double height, double depth) {
+        const double center_x = width * 0.5;
+        const double center_y = height * 0.5;
+        const double center_z = depth * 0.5;
+        const double radius = std::max({width, height, depth}) * 0.35;
+        const double golden_angle = 2.39996322972865332;
+        const auto n = static_cast<double>(positions.size());
+        for (std::size_t i = 0; i < positions.size(); ++i) {
+            const double y = 1.0 - 2.0 * static_cast<double>(i) / n;
+            const double r = std::sqrt(std::max(1.0 - y * y, 0.0));
+            const double theta = golden_angle * static_cast<double>(i);
+            positions[i] = Coordinate3D{
+                center_x + radius * r * std::cos(theta),
+                center_y + radius * r * std::sin(theta),
+                center_z + radius * y
+            };
+        }
+    }
+
+    static void apply_pairwise_repulsion_3d(std::size_t i,
+                                             std::size_t j,
+                                             const std::vector<Coordinate3D>& positions,
+                                             double scaling_ratio,
+                                             std::vector<Coordinate3D>& local) {
+        const double dx = positions[i].x - positions[j].x;
+        const double dy = positions[i].y - positions[j].y;
+        const double dz = positions[i].z - positions[j].z;
+        const double distance = std::max(
+            std::sqrt(dx * dx + dy * dy + dz * dz), min_distance());
+        const double force = scaling_ratio / (distance * distance);
+        local[i].x += (dx / distance) * force;
+        local[i].y += (dy / distance) * force;
+        local[i].z += (dz / distance) * force;
+    }
+
+    void apply_attraction_3d(std::size_t source,
+                              std::size_t target,
+                              const graph::Edge& edge,
+                              const std::vector<Coordinate3D>& positions,
+                              std::vector<Coordinate3D>& local) const {
+        const double dx = positions[source].x - positions[target].x;
+        const double dy = positions[source].y - positions[target].y;
+        const double dz = positions[source].z - positions[target].z;
+        const double distance = std::max(
+            std::sqrt(dx * dx + dy * dy + dz * dz), min_distance());
+        const double edge_weight = std::max(edge.weight, 0.0);
+        const double influenced_weight = edge_weight_influence_ == 0.0
+            ? 1.0
+            : (edge_weight_influence_ == 1.0
+               ? edge_weight
+               : std::pow(edge_weight, edge_weight_influence_));
+        const double attraction = lin_log_mode_
+            ? influenced_weight * std::log1p(distance)
+            : influenced_weight * distance;
+        const double scaled = attraction / std::max(scaling_ratio_, 1.0);
+        const double fx = (dx / distance) * scaled;
+        const double fy = (dy / distance) * scaled;
+        const double fz = (dz / distance) * scaled;
+        local[source].x -= fx;
+        local[source].y -= fy;
+        local[source].z -= fz;
+        local[target].x += fx;
+        local[target].y += fy;
+        local[target].z += fz;
+    }
+
+    template<typename Worker>
+    void parallel_for_3d(std::size_t count,
+                          Worker worker,
+                          std::vector<Coordinate3D>& aggregate) const {
+        const std::size_t workers =
+            std::min<std::size_t>(std::max<std::size_t>(1, thread_count_), count);
+        std::vector<std::vector<Coordinate3D>> locals(
+            workers, std::vector<Coordinate3D>(count, Coordinate3D{}));
+        std::vector<std::thread> threads;
+        threads.reserve(workers);
+        for (std::size_t worker_index = 0; worker_index < workers; ++worker_index) {
+            const std::size_t begin = worker_index * count / workers;
+            const std::size_t end = (worker_index + 1) * count / workers;
+            threads.emplace_back([&, worker_index, begin, end] {
+                worker(begin, end, locals[worker_index]);
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        for (const auto& local : locals) {
+            for (std::size_t i = 0; i < aggregate.size(); ++i) {
+                aggregate[i].x += local[i].x;
+                aggregate[i].y += local[i].y;
+                aggregate[i].z += local[i].z;
+            }
+        }
+    }
+
+    template<typename Worker>
+    void parallel_for_edges_3d(
+            const graph::Graph<graph::Node, graph::Edge>::EdgeMap& edges,
+            const std::unordered_map<graph::NodeId, std::size_t>&,
+            Worker worker,
+            std::vector<Coordinate3D>& aggregate) const {
+        std::vector<const graph::Edge*> edge_list;
+        edge_list.reserve(edges.size());
+        for (const auto& [edge_id, edge] : edges) {
+            (void)edge_id;
+            edge_list.push_back(&edge);
+        }
+        const std::size_t workers =
+            std::min<std::size_t>(std::max<std::size_t>(1, thread_count_),
+                                  std::max<std::size_t>(edge_list.size(), 1));
+        std::vector<std::vector<Coordinate3D>> locals(
+            workers, std::vector<Coordinate3D>(aggregate.size(), Coordinate3D{}));
+        std::vector<std::thread> threads;
+        threads.reserve(workers);
+        for (std::size_t worker_index = 0; worker_index < workers; ++worker_index) {
+            const std::size_t begin = worker_index * edge_list.size() / workers;
+            const std::size_t end = (worker_index + 1) * edge_list.size() / workers;
+            threads.emplace_back([&, worker_index, begin, end] {
+                std::vector<const graph::Edge*> chunk;
+                chunk.reserve(end - begin);
+                for (std::size_t i = begin; i < end; ++i) {
+                    chunk.push_back(edge_list[i]);
+                }
+                worker(chunk, locals[worker_index]);
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        for (const auto& local : locals) {
+            for (std::size_t i = 0; i < aggregate.size(); ++i) {
+                aggregate[i].x += local[i].x;
+                aggregate[i].y += local[i].y;
+                aggregate[i].z += local[i].z;
+            }
+        }
+    }
+
+    static void rescale_positions_3d(std::vector<Coordinate3D>& positions,
+                                      double target_min_x, double target_max_x,
+                                      double target_min_y, double target_max_y,
+                                      double target_min_z, double target_max_z) {
+        double min_x = std::numeric_limits<double>::max();
+        double max_x = std::numeric_limits<double>::lowest();
+        double min_y = std::numeric_limits<double>::max();
+        double max_y = std::numeric_limits<double>::lowest();
+        double min_z = std::numeric_limits<double>::max();
+        double max_z = std::numeric_limits<double>::lowest();
+        for (const auto& position : positions) {
+            min_x = std::min(min_x, position.x);
+            max_x = std::max(max_x, position.x);
+            min_y = std::min(min_y, position.y);
+            max_y = std::max(max_y, position.y);
+            min_z = std::min(min_z, position.z);
+            max_z = std::max(max_z, position.z);
+        }
+        const double span_x = max_x - min_x;
+        const double span_y = max_y - min_y;
+        const double span_z = max_z - min_z;
+        const double target_span_x = target_max_x - target_min_x;
+        const double target_span_y = target_max_y - target_min_y;
+        const double target_span_z = target_max_z - target_min_z;
+        for (auto& position : positions) {
+            position.x = (span_x <= min_distance())
+                ? (target_min_x + target_max_x) * 0.5
+                : target_min_x + ((position.x - min_x) / span_x) * target_span_x;
+            position.y = (span_y <= min_distance())
+                ? (target_min_y + target_max_y) * 0.5
+                : target_min_y + ((position.y - min_y) / span_y) * target_span_y;
+            position.z = (span_z <= min_distance())
+                ? (target_min_z + target_max_z) * 0.5
+                : target_min_z + ((position.z - min_z) / span_z) * target_span_z;
+        }
+    }
+
+    std::size_t iterations_;
+    double width_;
+    double height_;
+    double depth_;
+    double margin_;
+    double scaling_ratio_;
+    double gravity_;
+    bool lin_log_mode_;
+    double edge_weight_influence_;
+    std::size_t thread_count_;
+};
+
 class CommunityForceAtlas2Layout : public Layout {
 public:
     explicit CommunityForceAtlas2Layout(double width = 1024.0,
@@ -1070,6 +1461,12 @@ private:
     double width_;
     double height_;
     double margin_;
+};
+
+struct QuotientGraph {
+    graph::Graph<graph::Node, graph::Edge> graph;
+    std::map<graph::CommunityId, graph::NodeId> community_to_node;
+    std::vector<std::vector<graph::NodeId>> communities;
 };
 
 class CommunityLayoutSupport {
@@ -1188,15 +1585,35 @@ public:
         double width,
         double height,
         double margin) {
-        const auto assignment = normalize_assignment(input_graph, explicit_assignment);
-        const auto communities = bucket_nodes(assignment);
-        graph::Graph<graph::Node, graph::Edge> quotient;
-        std::map<graph::CommunityId, graph::NodeId> community_nodes;
-        for (std::size_t i = 0; i < communities.size(); ++i) {
-            const auto community_id = assignment.at(communities[i].front());
+        const auto quotient = build_quotient_graph(input_graph, explicit_assignment);
+
+        ForceAtlas2Layout community_layout(100, width, height, margin, 10.0, 1.0, false, 1.0, true, 1.2, 2);
+        const auto coordinates = quotient.graph.getNodes().empty()
+            ? CoordinateMap{}
+            : community_layout.compute(quotient.graph);
+
+        std::vector<Coordinate> centers;
+        centers.reserve(quotient.communities.size());
+        for (std::size_t i = 0; i < quotient.communities.size(); ++i) {
             const auto node_id = graph::NodeId{static_cast<uint32_t>(i)};
-            community_nodes[community_id] = node_id;
-            quotient.createNode(node_id, "c" + std::to_string(i));
+            const auto it = coordinates.find(node_id);
+            centers.push_back(it != coordinates.end() ? it->second : Coordinate{width * 0.5, height * 0.5});
+        }
+        return centers;
+    }
+
+    static QuotientGraph build_quotient_graph(
+        const graph::Graph<graph::Node, graph::Edge>& input_graph,
+        const std::unordered_map<graph::NodeId, graph::CommunityId>& explicit_assignment) {
+        const auto assignment = normalize_assignment(input_graph, explicit_assignment);
+
+        QuotientGraph quotient;
+        quotient.communities = bucket_nodes(assignment);
+        for (std::size_t i = 0; i < quotient.communities.size(); ++i) {
+            const auto community_id = assignment.at(quotient.communities[i].front());
+            const auto node_id = graph::NodeId{static_cast<uint32_t>(i)};
+            quotient.community_to_node[community_id] = node_id;
+            quotient.graph.createNode(node_id, "c" + std::to_string(i));
         }
 
         std::map<std::pair<graph::CommunityId, graph::CommunityId>, graph::EdgeId> quotient_edges;
@@ -1210,28 +1627,17 @@ public:
             const auto ordered = std::minmax(src_comm, tgt_comm);
             auto pair_it = quotient_edges.find(ordered);
             if (pair_it == quotient_edges.end()) {
-                auto& created = quotient.createEdge(community_nodes.at(ordered.first), community_nodes.at(ordered.second));
+                auto& created = quotient.graph.createEdge(quotient.community_to_node.at(ordered.first),
+                                                          quotient.community_to_node.at(ordered.second));
                 created.weight = edge.weight;
-                quotient.connect(created.id, community_nodes.at(ordered.first));
+                quotient.graph.connect(created.id, quotient.community_to_node.at(ordered.first));
                 quotient_edges.emplace(ordered, created.id);
             } else {
-                quotient.getEdges().at(pair_it->second).weight += edge.weight;
+                quotient.graph.getEdges().at(pair_it->second).weight += edge.weight;
             }
         }
 
-        ForceAtlas2Layout community_layout(100, width, height, margin, 10.0, 1.0, false, 1.0, true, 1.2, 2);
-        const auto coordinates = quotient.getNodes().empty()
-            ? CoordinateMap{}
-            : community_layout.compute(quotient);
-
-        std::vector<Coordinate> centers;
-        centers.reserve(communities.size());
-        for (std::size_t i = 0; i < communities.size(); ++i) {
-            const auto node_id = graph::NodeId{static_cast<uint32_t>(i)};
-            const auto it = coordinates.find(node_id);
-            centers.push_back(it != coordinates.end() ? it->second : Coordinate{width * 0.5, height * 0.5});
-        }
-        return centers;
+        return quotient;
     }
 
 private:
@@ -2149,6 +2555,9 @@ private:
         };
         creators_["gkk"] = [] {
             return std::make_unique<GridKamadaKawaiLayout>();
+        };
+        creators_["fa3d"] = [] {
+            return std::make_unique<ForceAtlas3DLayout>();
         };
     }
 

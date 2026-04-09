@@ -7,6 +7,7 @@
 #include <satgraf/evolution.hpp>
 #include <satgraf/solver.hpp>
 #include <satgraf_gui/graph_renderer.hpp>
+#include <satgraf_gui/graph_view_3d.hpp>
 #include <satgraf_gui/export.hpp>
 
 #include <QMainWindow>
@@ -34,12 +35,14 @@
 #include <QWindow>
 #include <QPainter>
 #include <QPainterPath>
+#include <numeric>
 #include <string>
 #include <memory>
 #include <optional>
 #include <set>
 #include <thread>
 #include <atomic>
+#include <unordered_set>
 
 namespace satgraf::gui {
 
@@ -118,6 +121,8 @@ private:
     QPoint drag_start_;
 };
 
+enum class RenderMode { Detailed2D, Simple2D, Mode3D, Simple3D };
+
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
@@ -168,6 +173,8 @@ public slots:
             stats_edges_->setText(QString::number(graph_->edgeCount()));
             stats_communities_->setText("—");
             stats_modularity_->setText("—");
+            stats_internal_edges_->setText("—");
+            stats_external_edges_->setText("—");
 
             render_btn_->setEnabled(true);
             start_solver_btn_->setEnabled(true);
@@ -215,7 +222,7 @@ public slots:
                     unique.insert(cid);
                 }
 
-                int iters = iterations_slider_ ? iterations_slider_->value() : 500;
+                int iters = iterations_slider_ ? iterations_slider_->value() : 20;
                 auto layout = layout::LayoutFactory::instance().create(layout_name_);
                 auto coords = layout->compute(*graph_,
                     [this](double p) {
@@ -255,22 +262,30 @@ public slots:
         }
         stats_communities_->setText(QString::number(unique.size()));
         stats_modularity_->setText(QString::number(communities_.q_modularity, 'f', 3));
+        stats_internal_edges_->setText(QString::number(communities_.intra_edges));
+        stats_external_edges_->setText(QString::number(communities_.inter_edges));
 
-        double node_size = node_size_slider_ ? node_size_slider_->value() : 10;
-        renderer_->render(*graph_, coords_, communities_, node_size, 1.0);
-        view_->scene()->setBackgroundBrush(bg_brush_);
-        view_->setBackgroundBrush(bg_brush_);
-        renderer_->add_labels(*graph_);
-        renderer_->set_scene_rect(renderer_->compute_scene_rect(coords_));
-        if (view_) view_->fit_all();
+        bridge_nodes_ = satgraf::community::detail::compute_bridge_nodes(communities_, *graph_);
 
-        renderer_->set_community_regions_visible(community_region_check_->isChecked());
+        compute_quotient_data();
+
+        if (!graph_->getNodes().empty()) {
+            int fa3d_iters = iterations_slider_ ? iterations_slider_->value() : 20;
+            layout::ForceAtlas3DLayout fa3d(fa3d_iters, 1024.0, 1024.0, 1024.0, 0.0,
+                                             10.0, 1.0, false, 1.0, 2);
+            coords_3d_ = fa3d.compute3D(*graph_);
+        } else {
+            coords_3d_.clear();
+        }
+
+        perform_render();
 
         populate_community_combo();
 
         rendering_active_.store(false);
         render_btn_->setText("▶  Render");
         set_controls_enabled(true);
+        node_search_edit_->setEnabled(true);
         log("Render complete");
     }
 
@@ -292,8 +307,10 @@ public slots:
     void set_controls_enabled(bool enabled) {
         community_combo_->setEnabled(enabled);
         layout_combo_->setEnabled(enabled);
+        render_mode_combo_->setEnabled(enabled && !evolution_active_);
         iterations_slider_->setEnabled(enabled);
         node_size_slider_->setEnabled(enabled);
+        edge_size_slider_->setEnabled(enabled);
         community_region_check_->setEnabled(enabled);
         community_select_combo_->setEnabled(enabled);
         start_solver_btn_->setEnabled(enabled && graph_ != nullptr);
@@ -337,6 +354,19 @@ public slots:
         community_method_ = name.toStdString();
     }
 
+    void on_render_mode_changed(int index) {
+        switch (index) {
+            case 0: render_mode_ = RenderMode::Detailed2D; break;
+            case 1: render_mode_ = RenderMode::Simple2D; break;
+            case 2: render_mode_ = RenderMode::Mode3D; break;
+            case 3: render_mode_ = RenderMode::Simple3D; break;
+            default: render_mode_ = RenderMode::Detailed2D; break;
+        }
+        if (!coords_.empty() && graph_) {
+            perform_render();
+        }
+    }
+
     void set_background(const QString& color_name) {
         if (!view_) return;
         if (color_name == "Dark") {
@@ -351,24 +381,76 @@ public slots:
         view_->setBackgroundBrush(bg_brush_);
         view_->scene()->setBackgroundBrush(bg_brush_);
         view_->viewport()->update();
+        if (view_3d_) {
+            QColor bg3d = bg_brush_.color();
+            if (!bg3d.isValid() || bg3d.alpha() == 0) bg3d = QColor(0, 0, 0);
+            view_3d_->setBackgroundColor(bg3d);
+        }
     }
 
     void on_community_selected(int index) {
         if (index < 0 || !graph_) return;
         uint32_t cid = static_cast<uint32_t>(community_select_combo_->itemData(index).toUInt());
 
-        QColor color = rendering::community_color(cid);
-        int count = 0;
-        for (const auto& [nid, c] : communities_.assignment) {
-            (void)nid;
-            if (c.value == cid) count++;
+        if (cid == 0xFFFFFFFF) {
+            comm_nodes_label_->setText("—");
+            comm_bridge_label_->setText("—");
+            comm_internal_edges_label_->setText("—");
+            comm_external_edges_label_->setText("—");
+            comm_linked_label_->setText("—");
+            selected_community_ = std::nullopt;
+            renderer_->highlight_community(std::nullopt);
+            if (view_3d_) view_3d_->highlightCommunity(std::nullopt);
+            return;
         }
 
-        community_detail_->setText(
-            QString("Community %1\nColor: %2\nNodes: %3")
-                .arg(cid)
-                .arg(color.name())
-                .arg(count));
+        selected_community_ = cid;
+        if (highlight_check_->isChecked()) {
+            renderer_->highlight_community(cid);
+            if (render_mode_ == RenderMode::Mode3D && view_3d_ && view_3d_->isVisible()) {
+                view_3d_->highlightCommunity(cid);
+            }
+        }
+
+        int internal_node_count = 0;
+        int bridge_node_count = 0;
+        for (const auto& [nid, c] : communities_.assignment) {
+            if (c.value == cid) {
+                internal_node_count++;
+                if (bridge_nodes_.count(nid)) bridge_node_count++;
+            }
+        }
+
+        int internal_edge_count = 0;
+        int external_edge_count = 0;
+        std::set<uint32_t> linked_communities;
+
+        for (const auto& [eid, edge] : graph_->getEdges()) {
+            (void)eid;
+            auto src_it = communities_.assignment.find(edge.source);
+            auto tgt_it = communities_.assignment.find(edge.target);
+            if (src_it == communities_.assignment.end() ||
+                tgt_it == communities_.assignment.end()) {
+                continue;
+            }
+
+            bool src_in = (src_it->second.value == cid);
+            bool tgt_in = (tgt_it->second.value == cid);
+
+            if (src_in && tgt_in) {
+                internal_edge_count++;
+            } else if (src_in || tgt_in) {
+                external_edge_count++;
+                uint32_t other_cid = src_in ? tgt_it->second.value : src_it->second.value;
+                linked_communities.insert(other_cid);
+            }
+        }
+
+        comm_nodes_label_->setText(QString::number(internal_node_count));
+        comm_bridge_label_->setText(QString::number(bridge_node_count));
+        comm_internal_edges_label_->setText(QString::number(internal_edge_count));
+        comm_external_edges_label_->setText(QString::number(external_edge_count));
+        comm_linked_label_->setText(QString::number(static_cast<int>(linked_communities.size())));
     }
 
     void on_node_clicked(satgraf::graph::NodeId id) {
@@ -378,18 +460,85 @@ public slots:
         if (!node_opt) return;
 
         uint32_t cid = 0;
+        bool has_community = false;
         auto cit = communities_.assignment.find(id);
-        if (cit != communities_.assignment.end()) cid = cit->second.value;
+        if (cit != communities_.assignment.end()) {
+            cid = cit->second.value;
+            has_community = true;
+        }
 
         QColor color = rendering::community_color(cid);
         renderer_->set_decision_variable(id, coords_,
                                           static_cast<double>(node_size_slider_->value()));
 
-        node_detail_->setText(
-            QString("Node %1\nCommunity: %2\nColor: %3")
-                .arg(id.value).arg(cid).arg(color.name()));
+        node_search_edit_->setText(QString::number(id.value));
 
-        log(QString("Selected node %1, community %2").arg(id.value).arg(cid));
+        int internal_neighbors = 0;
+        int external_neighbors = 0;
+        std::set<uint32_t> linked_communities;
+
+        if (has_community && !communities_.assignment.empty()) {
+            const auto& node = node_opt->get();
+            for (const auto& eid : node.edges) {
+                auto edge_it = graph_->getEdges().find(eid);
+                if (edge_it == graph_->getEdges().end()) continue;
+                const auto& edge = edge_it->second;
+
+                graph::NodeId neighbor =
+                    (edge.source == id) ? edge.target : edge.source;
+
+                auto neighbor_it = communities_.assignment.find(neighbor);
+                if (neighbor_it == communities_.assignment.end()) continue;
+
+                if (neighbor_it->second.value == cid) {
+                    internal_neighbors++;
+                } else {
+                    external_neighbors++;
+                    linked_communities.insert(neighbor_it->second.value);
+                }
+            }
+        }
+
+        QString community_str = has_community ? QString::number(cid) : QString("—");
+        QString int_nbr_str = has_community ? QString::number(internal_neighbors) : QString("—");
+        QString ext_nbr_str = has_community ? QString::number(external_neighbors) : QString("—");
+        QString linked_str = has_community ? QString::number(static_cast<int>(linked_communities.size())) : QString("—");
+
+        node_id_label_->setText(QString("%1 (%2)")
+            .arg(id.value)
+            .arg(QString::fromStdString(node_opt->get().name)));
+        node_community_label_->setText(community_str);
+        node_int_nbr_label_->setText(int_nbr_str);
+        node_ext_nbr_label_->setText(ext_nbr_str);
+        node_linked_label_->setText(linked_str);
+
+        log(QString("Selected node %1, community %2").arg(id.value).arg(community_str));
+    }
+
+    void on_node_search() {
+        if (!graph_) return;
+
+        QString text = node_search_edit_->text().trimmed();
+        if (text.isEmpty()) return;
+
+        bool ok = false;
+        uint32_t num = text.toUInt(&ok);
+        if (ok) {
+            graph::NodeId candidate{num};
+            if (graph_->getNode(candidate)) {
+                on_node_clicked(candidate);
+                return;
+            }
+        }
+
+        for (const auto& [nid, node] : graph_->getNodes()) {
+            if (QString::fromStdString(node.name).startsWith(text, Qt::CaseInsensitive)) {
+                on_node_clicked(nid);
+                return;
+            }
+        }
+
+        log("Node not found: " + text);
     }
 
     void load_cnf(const std::string& path) {
@@ -426,6 +575,8 @@ public slots:
                 start_solver_btn_->disconnect();
                 connect(start_solver_btn_, &QPushButton::clicked, this, &MainWindow::start_solver);
                 step_back_btn_->setEnabled(engine_ && engine_->history_depth() > 0);
+                evolution_active_ = false;
+                render_mode_combo_->setEnabled(true);
                 log("Solver stopped");
             });
 
@@ -437,6 +588,16 @@ public slots:
             solver_timer_ = new QTimer(this);
             connect(solver_timer_, &QTimer::timeout, this, &MainWindow::on_solver_timer);
             solver_timer_->start(100);
+
+            evolution_active_ = true;
+            render_mode_ = RenderMode::Detailed2D;
+            render_mode_combo_->blockSignals(true);
+            render_mode_combo_->setCurrentIndex(0);
+            render_mode_combo_->blockSignals(false);
+            render_mode_combo_->setEnabled(false);
+            if (!coords_.empty() && graph_) {
+                perform_render();
+            }
 
             log("Solver started");
         } catch (const std::exception& e) {
@@ -451,6 +612,8 @@ public slots:
             start_solver_btn_->setText("▶  Start Solver");
             start_solver_btn_->disconnect();
             connect(start_solver_btn_, &QPushButton::clicked, this, &MainWindow::start_solver);
+            evolution_active_ = false;
+            render_mode_combo_->setEnabled(true);
             log("Solver finished");
             update_evolution_ui();
             return;
@@ -529,16 +692,43 @@ private:
         connect(view_, &rendering::GraphView::node_clicked,
                 this, &MainWindow::on_node_clicked);
 
+        renderer_->set_community_click_callback([this](uint32_t cid) {
+            for (int i = 0; i < community_select_combo_->count(); ++i) {
+                if (community_select_combo_->itemData(i).toUInt() == cid) {
+                    community_select_combo_->setCurrentIndex(i);
+                    break;
+                }
+            }
+        });
+
+        view_3d_ = new GraphView3D(this);
+        view_3d_->hide();
+        connect(view_3d_, &GraphView3D::communityClicked,
+                this, [this](uint32_t cid) {
+            for (int i = 0; i < community_select_combo_->count(); ++i) {
+                if (community_select_combo_->itemData(i).toUInt() == cid) {
+                    community_select_combo_->setCurrentIndex(i);
+                    break;
+                }
+            }
+        });
+        connect(view_3d_, &GraphView3D::nodeClicked,
+                this, [this](uint32_t nid) {
+            on_node_clicked(satgraf::graph::NodeId{nid});
+        });
+
         auto* left_panel = build_left_panel();
         auto* right_panel = build_right_panel();
 
         main_splitter->addWidget(left_panel);
         main_splitter->addWidget(view_);
+        main_splitter->addWidget(view_3d_);
         main_splitter->addWidget(right_panel);
 
         main_splitter->setStretchFactor(0, 0);
         main_splitter->setStretchFactor(1, 1);
-        main_splitter->setStretchFactor(2, 0);
+        main_splitter->setStretchFactor(2, 1);
+        main_splitter->setStretchFactor(3, 0);
 
         left_panel->setFixedWidth(256);
         right_panel->setFixedWidth(230);
@@ -582,6 +772,18 @@ private:
             return combo;
         }());
 
+        add_form_row(layout, "Render Mode:", [&] {
+            auto* combo = new QComboBox(this);
+            combo->addItem("2D", 0);
+            combo->addItem("Simple 2D", 1);
+            combo->addItem("3D", 2);
+            combo->addItem("Simple 3D", 3);
+            connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    this, &MainWindow::on_render_mode_changed);
+            render_mode_combo_ = combo;
+            return combo;
+        }());
+
         add_form_row(layout, "Background:", [&] {
             auto* combo = new QComboBox(this);
             combo->addItems({"Dark", "White", "Light Gray", "Transparent"});
@@ -594,9 +796,9 @@ private:
             auto* hl = new QHBoxLayout(row);
             hl->setContentsMargins(0, 0, 0, 0);
             auto* slider = new QSlider(Qt::Horizontal, this);
-            slider->setRange(50, 2000);
-            slider->setValue(500);
-            auto* val = new QLabel("500", this);
+            slider->setRange(1, 500);
+            slider->setValue(20);
+            auto* val = new QLabel("20", this);
             val->setFixedWidth(35);
             connect(slider, &QSlider::valueChanged, this, [val](int v) {
                 val->setText(QString::number(v));
@@ -612,23 +814,40 @@ private:
             auto* hl = new QHBoxLayout(row);
             hl->setContentsMargins(0, 0, 0, 0);
             auto* slider = new QSlider(Qt::Horizontal, this);
-            slider->setRange(2, 40);
+            slider->setRange(1, 25);
             slider->setValue(10);
             auto* val = new QLabel("10", this);
             val->setFixedWidth(25);
             connect(slider, &QSlider::valueChanged, this, [this, val](int v) {
                 val->setText(QString::number(v));
                 if (!coords_.empty()) {
-                    renderer_->render(*graph_, coords_, communities_,
-                                      static_cast<double>(v), 1.0);
-                    renderer_->add_labels(*graph_);
-                    renderer_->set_scene_rect(
-                        renderer_->compute_scene_rect(coords_));
+                    perform_render();
                 }
             });
             hl->addWidget(slider);
             hl->addWidget(val);
             node_size_slider_ = slider;
+            return row;
+        }());
+
+        add_form_row(layout, "Edge Size:", [&] {
+            auto* row = new QWidget(this);
+            auto* hl = new QHBoxLayout(row);
+            hl->setContentsMargins(0, 0, 0, 0);
+            auto* slider = new QSlider(Qt::Horizontal, this);
+            slider->setRange(1, 10);
+            slider->setValue(1);
+            auto* val = new QLabel("1", this);
+            val->setFixedWidth(25);
+            connect(slider, &QSlider::valueChanged, this, [this, val](int v) {
+                val->setText(QString::number(v));
+                if (!coords_.empty()) {
+                    perform_render();
+                }
+            });
+            hl->addWidget(slider);
+            hl->addWidget(val);
+            edge_size_slider_ = slider;
             return row;
         }());
 
@@ -718,14 +937,25 @@ private:
 
         auto* stats_grid = new QFormLayout();
         stats_grid->setSpacing(4);
+        stats_grid->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
         stats_nodes_ = new QLabel("0", this);
+        stats_nodes_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         stats_edges_ = new QLabel("0", this);
+        stats_edges_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         stats_communities_ = new QLabel("—", this);
+        stats_communities_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         stats_modularity_ = new QLabel("—", this);
+        stats_modularity_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         stats_grid->addRow("Nodes:", stats_nodes_);
         stats_grid->addRow("Edges:", stats_edges_);
         stats_grid->addRow("Communities:", stats_communities_);
         stats_grid->addRow("Modularity:", stats_modularity_);
+        stats_internal_edges_ = new QLabel("—", this);
+        stats_internal_edges_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        stats_external_edges_ = new QLabel("—", this);
+        stats_external_edges_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        stats_grid->addRow("Internal Edges:", stats_internal_edges_);
+        stats_grid->addRow("External Edges:", stats_external_edges_);
         layout->addLayout(stats_grid);
 
         layout->addWidget(separator());
@@ -739,20 +969,76 @@ private:
                 this, &MainWindow::on_community_selected);
         layout->addWidget(community_select_combo_);
 
-        community_detail_ = new QLabel("", this);
-        community_detail_->setWordWrap(true);
-        community_detail_->setMinimumHeight(50);
-        layout->addWidget(community_detail_);
+        highlight_check_ = new QCheckBox("Highlight", this);
+        highlight_check_->setChecked(true);
+        connect(highlight_check_, &QCheckBox::toggled, this, [this]() {
+            if (selected_community_ && highlight_check_->isChecked()) {
+                renderer_->highlight_community(selected_community_);
+                if (render_mode_ == RenderMode::Mode3D && view_3d_ && view_3d_->isVisible()) {
+                if (highlight_check_->isChecked() && selected_community_) {
+                    view_3d_->highlightCommunity(selected_community_);
+                } else {
+                    view_3d_->highlightCommunity(std::nullopt);
+                }
+                }
+            } else {
+                renderer_->highlight_community(std::nullopt);
+                if (view_3d_) view_3d_->highlightCommunity(std::nullopt);
+            }
+        });
+        layout->addWidget(highlight_check_);
+
+        auto* comm_grid = new QFormLayout();
+        comm_grid->setSpacing(4);
+        comm_grid->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        comm_nodes_label_ = new QLabel("—", this);
+        comm_nodes_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        comm_bridge_label_ = new QLabel("—", this);
+        comm_bridge_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        comm_internal_edges_label_ = new QLabel("—", this);
+        comm_internal_edges_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        comm_external_edges_label_ = new QLabel("—", this);
+        comm_external_edges_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        comm_linked_label_ = new QLabel("—", this);
+        comm_linked_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        comm_grid->addRow("Nodes:", comm_nodes_label_);
+        comm_grid->addRow("Bridge Nodes:", comm_bridge_label_);
+        comm_grid->addRow("Internal Edges:", comm_internal_edges_label_);
+        comm_grid->addRow("External Edges:", comm_external_edges_label_);
+        comm_grid->addRow("Linked Communities:", comm_linked_label_);
+        layout->addLayout(comm_grid);
 
         layout->addWidget(separator());
 
         auto* node_title = new QLabel("<b>Selected Node</b>", this);
         layout->addWidget(node_title);
 
-        node_detail_ = new QLabel("Click a node", this);
-        node_detail_->setWordWrap(true);
-        node_detail_->setMinimumHeight(50);
-        layout->addWidget(node_detail_);
+        node_search_edit_ = new QLineEdit(this);
+        node_search_edit_->setPlaceholderText("Search node by ID...");
+        node_search_edit_->setEnabled(false);
+        connect(node_search_edit_, &QLineEdit::returnPressed,
+                this, &MainWindow::on_node_search);
+        layout->addWidget(node_search_edit_);
+
+        auto* node_grid = new QFormLayout();
+        node_grid->setSpacing(4);
+        node_grid->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        node_id_label_ = new QLabel("—", this);
+        node_id_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        node_community_label_ = new QLabel("—", this);
+        node_community_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        node_int_nbr_label_ = new QLabel("—", this);
+        node_int_nbr_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        node_ext_nbr_label_ = new QLabel("—", this);
+        node_ext_nbr_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        node_linked_label_ = new QLabel("—", this);
+        node_linked_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        node_grid->addRow("Node:", node_id_label_);
+        node_grid->addRow("Community:", node_community_label_);
+        node_grid->addRow("Internal Neighbors:", node_int_nbr_label_);
+        node_grid->addRow("External Neighbors:", node_ext_nbr_label_);
+        node_grid->addRow("Linked Communities:", node_linked_label_);
+        layout->addLayout(node_grid);
 
         layout->addStretch();
         layout->addWidget(separator());
@@ -819,7 +1105,8 @@ private:
     void re_render_evolution() {
         if (!graph_ || coords_.empty()) return;
         double node_size = node_size_slider_ ? node_size_slider_->value() : 10;
-        renderer_->render(*graph_, coords_, communities_, node_size, 1.0);
+        double edge_size = edge_size_slider_ ? edge_size_slider_->value() : 1.0;
+        renderer_->render(*graph_, coords_, communities_, node_size, edge_size);
         view_->scene()->setBackgroundBrush(bg_brush_);
         view_->setBackgroundBrush(bg_brush_);
         renderer_->add_labels(*graph_);
@@ -831,12 +1118,162 @@ private:
                 renderer_->set_decision_variable(*dv, coords_, node_size);
             }
         }
+
+        if (selected_community_) {
+            renderer_->highlight_community(selected_community_);
+        }
+    }
+
+    void compute_quotient_data() {
+        if (!graph_ || communities_.assignment.empty()) return;
+
+        quotient_graph_ = layout::CommunityLayoutSupport::build_quotient_graph(
+            *graph_, communities_.assignment);
+
+        community_centers_ = layout::CommunityLayoutSupport::community_forceatlas_centers(
+            *graph_, communities_.assignment, 1024.0, 1024.0, 0.0);
+
+        community_sizes_.clear();
+        community_ids_.clear();
+        for (const auto& community : quotient_graph_.communities) {
+            community_sizes_.push_back(community.size());
+            auto cid = communities_.assignment.at(community.front());
+            community_ids_.push_back(cid.value);
+        }
+
+        inter_community_edges_.clear();
+        for (const auto& [eid, edge] : graph_->getEdges()) {
+            (void)eid;
+            auto src_it = communities_.assignment.find(edge.source);
+            auto tgt_it = communities_.assignment.find(edge.target);
+            if (src_it == communities_.assignment.end() ||
+                tgt_it == communities_.assignment.end()) continue;
+
+            auto src_cid = src_it->second.value;
+            auto tgt_cid = tgt_it->second.value;
+            if (src_cid == tgt_cid) continue;
+
+            auto ordered = std::minmax(src_cid, tgt_cid);
+            inter_community_edges_[ordered] += edge.weight;
+        }
+
+        if (!quotient_graph_.graph.getNodes().empty()) {
+            int fa3d_iters = iterations_slider_ ? iterations_slider_->value() : 20;
+            layout::ForceAtlas3DLayout fa3d(fa3d_iters, 1024.0, 1024.0, 1024.0, 0.0,
+                                             10.0, 1.0, false, 1.0, 2);
+            community_centers_3d_ = fa3d.compute3D(quotient_graph_.graph);
+        } else {
+            community_centers_3d_.clear();
+        }
+    }
+
+    void perform_render() {
+        double node_size = node_size_slider_ ? node_size_slider_->value() : 10;
+        double edge_size = edge_size_slider_ ? edge_size_slider_->value() : 1.0;
+
+        double avg_community_size = community_sizes_.empty() ? 1.0
+            : std::accumulate(community_sizes_.begin(), community_sizes_.end(), 0.0)
+              / static_cast<double>(community_sizes_.size());
+
+        switch (render_mode_) {
+            case RenderMode::Detailed2D: {
+                renderer_->render(*graph_, coords_, communities_, node_size, edge_size);
+                renderer_->store_graph(graph_.get());
+                view_->scene()->setBackgroundBrush(bg_brush_);
+                view_->setBackgroundBrush(bg_brush_);
+                renderer_->add_labels(*graph_);
+                renderer_->set_scene_rect(renderer_->compute_scene_rect(coords_));
+                if (view_) view_->fit_all();
+                renderer_->set_community_regions_visible(community_region_check_->isChecked());
+                if (highlight_check_->isChecked() && selected_community_) {
+                    renderer_->highlight_community(selected_community_);
+                }
+                view_3d_->hide();
+                view_->show();
+                break;
+            }
+            case RenderMode::Simple2D: {
+                perform_simple_2d_render(node_size, edge_size, avg_community_size);
+                view_3d_->hide();
+                view_->show();
+                break;
+            }
+            case RenderMode::Mode3D: {
+                if (!graph_ || coords_3d_.empty()) {
+                    view_3d_->hide();
+                    view_->show();
+                    break;
+                }
+
+                std::vector<QColor> palette;
+                for (std::size_t i = 0; i < 20; ++i) {
+                    palette.push_back(rendering::community_color(
+                        static_cast<uint32_t>(i)));
+                }
+
+                float radius = 0.10f * static_cast<float>(node_size / 10.0);
+                view_3d_->setFullGraph(
+                    coords_3d_, communities_.assignment, palette, radius, graph_.get(),
+                    static_cast<float>(edge_size));
+                view_3d_->highlightCommunity(selected_community_);
+
+                view_->hide();
+                view_3d_->show();
+                break;
+            }
+            case RenderMode::Simple3D: {
+                if (!graph_ || community_centers_3d_.empty()) {
+                    view_3d_->hide();
+                    view_->show();
+                    break;
+                }
+
+                std::unordered_map<uint32_t, QColor> community_colors;
+                for (auto cid : community_ids_) {
+                    community_colors[cid] = rendering::community_color(cid);
+                }
+
+                view_3d_->setGraph(
+                    community_centers_3d_, community_sizes_, community_ids_,
+                    inter_community_edges_, community_colors,
+                    static_cast<float>(node_size), avg_community_size,
+                    static_cast<float>(edge_size));
+
+                view_->hide();
+                view_3d_->show();
+                break;
+            }
+        }
+    }
+
+    void perform_simple_2d_render(double node_size, double edge_size, double avg_community_size) {
+        if (!graph_ || community_centers_.empty()) return;
+
+        std::unordered_map<uint32_t, QColor> community_colors;
+        for (auto cid : community_ids_) {
+            community_colors[cid] = rendering::community_color(cid);
+        }
+
+        renderer_->render_simple_2d(
+            community_centers_, community_sizes_, community_ids_,
+            inter_community_edges_, community_colors, node_size, avg_community_size, edge_size);
+
+        view_->scene()->setBackgroundBrush(bg_brush_);
+        view_->setBackgroundBrush(bg_brush_);
+
+        layout::CoordinateMap center_map;
+        for (std::size_t i = 0; i < community_centers_.size(); ++i) {
+            center_map[graph::NodeId{static_cast<uint32_t>(i)}] = community_centers_[i];
+        }
+        renderer_->set_scene_rect(renderer_->compute_scene_rect(center_map));
+        if (view_) view_->fit_all();
     }
 
     using Graph = graph::Graph<graph::Node, graph::Edge>;
 
     rendering::GraphRenderer* renderer_{nullptr};
     rendering::GraphView* view_{nullptr};
+    GraphView3D* view_3d_{nullptr};
     QBrush bg_brush_{Qt::black};
     TitleBar* title_bar_{nullptr};
 
@@ -846,23 +1283,51 @@ private:
     QComboBox* layout_combo_{nullptr};
     QSlider* iterations_slider_{nullptr};
     QSlider* node_size_slider_{nullptr};
+    QSlider* edge_size_slider_{nullptr};
     QCheckBox* community_region_check_{nullptr};
 
     QComboBox* community_select_combo_{nullptr};
-    QLabel* community_detail_{nullptr};
-    QLabel* node_detail_{nullptr};
+    QCheckBox* highlight_check_{nullptr};
+    QLabel* comm_nodes_label_{nullptr};
+    QLabel* comm_bridge_label_{nullptr};
+    QLabel* comm_internal_edges_label_{nullptr};
+    QLabel* comm_external_edges_label_{nullptr};
+    QLabel* comm_linked_label_{nullptr};
+    QLineEdit* node_search_edit_{nullptr};
+    QLabel* node_id_label_{nullptr};
+    QLabel* node_community_label_{nullptr};
+    QLabel* node_int_nbr_label_{nullptr};
+    QLabel* node_ext_nbr_label_{nullptr};
+    QLabel* node_linked_label_{nullptr};
     QLabel* log_label_{nullptr};
 
     QLabel* stats_nodes_{nullptr};
     QLabel* stats_edges_{nullptr};
     QLabel* stats_communities_{nullptr};
     QLabel* stats_modularity_{nullptr};
+    QLabel* stats_internal_edges_{nullptr};
+    QLabel* stats_external_edges_{nullptr};
 
     std::unique_ptr<Graph> graph_;
     community::CommunityResult communities_;
     layout::CoordinateMap coords_;
     std::string layout_name_{"f"};
     std::string community_method_{"louvain"};
+    std::unordered_set<satgraf::graph::NodeId> bridge_nodes_;
+    std::optional<uint32_t> selected_community_;
+
+    RenderMode render_mode_{RenderMode::Detailed2D};
+    QComboBox* render_mode_combo_{nullptr};
+    bool evolution_active_{false};
+
+    // Cached quotient graph data for mode switching
+    satgraf::layout::QuotientGraph quotient_graph_;
+    std::vector<satgraf::layout::Coordinate> community_centers_;
+    satgraf::layout::Coordinate3DMap community_centers_3d_;
+    satgraf::layout::Coordinate3DMap coords_3d_;
+    std::vector<std::size_t> community_sizes_;
+    std::vector<uint32_t> community_ids_;
+    std::map<std::pair<uint32_t, uint32_t>, double> inter_community_edges_;
 
     QString cnf_path_;
     solver::ExternalSolver solver_;

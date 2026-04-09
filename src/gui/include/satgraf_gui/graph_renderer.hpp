@@ -13,6 +13,7 @@
 #include <QGraphicsLineItem>
 #include <QGraphicsTextItem>
 #include <QGraphicsRectItem>
+#include <QGraphicsSceneMouseEvent>
 #include <QColor>
 #include <QPen>
 #include <QBrush>
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -214,6 +216,45 @@ public:
 
 private:
     uint32_t community_id_;
+};
+
+// ---------------------------------------------------------------------------
+// 8.4 — Community ellipse for Simple 2D click detection
+// ---------------------------------------------------------------------------
+
+class CommunityEllipseItem : public QGraphicsEllipseItem {
+public:
+    CommunityEllipseItem(uint32_t community_id, const QPointF& center,
+                         double diameter, const QColor& color,
+                         std::function<void(uint32_t)> callback)
+        : QGraphicsEllipseItem(center.x() - diameter / 2.0,
+                               center.y() - diameter / 2.0,
+                               diameter, diameter),
+          community_id_(community_id),
+          click_callback_(std::move(callback))
+    {
+        QColor fill = color;
+        fill.setAlpha(180);
+        setBrush(QBrush(fill));
+        setPen(QPen(color.darker(130), 1.5));
+        setZValue(1.0);
+        setFlag(QGraphicsItem::ItemIsSelectable, true);
+        setData(0, QVariant(QString("community:%1").arg(community_id)));
+    }
+
+    uint32_t community_id() const { return community_id_; }
+
+protected:
+    void mousePressEvent(QGraphicsSceneMouseEvent* event) override {
+        if (event->button() == Qt::LeftButton && click_callback_) {
+            click_callback_(community_id_);
+        }
+        QGraphicsEllipseItem::mousePressEvent(event);
+    }
+
+private:
+    uint32_t community_id_;
+    std::function<void(uint32_t)> click_callback_;
 };
 
 // ---------------------------------------------------------------------------
@@ -500,6 +541,50 @@ public:
 
     void set_scene_rect(const QRectF& rect) { scene_->setSceneRect(rect); }
 
+    void highlight_community(std::optional<uint32_t> cid) {
+        for (auto& [nid, item] : node_items_) {
+            (void)nid;
+            if (cid && item->community_id() == *cid) {
+                item->setZValue(2.0);
+            } else {
+                item->setZValue(1.0);
+            }
+        }
+
+        for (auto& [eid, edge_item] : edge_items_) {
+            (void)eid;
+            if (!cid) {
+                edge_item->setZValue(0.0);
+                continue;
+            }
+
+            const Graph* g = stored_graph_;
+            if (!g) {
+                edge_item->setZValue(0.0);
+                continue;
+            }
+
+            auto edge_it = g->getEdges().find(edge_item->edge_id());
+            if (edge_it == g->getEdges().end()) {
+                edge_item->setZValue(0.0);
+                continue;
+            }
+
+            const auto& edge = edge_it->second;
+            auto src_node_it = node_items_.find(edge.source);
+            auto tgt_node_it = node_items_.find(edge.target);
+
+            if (src_node_it != node_items_.end() &&
+                tgt_node_it != node_items_.end() &&
+                src_node_it->second->community_id() == *cid &&
+                tgt_node_it->second->community_id() == *cid) {
+                edge_item->setZValue(1.5);
+            } else {
+                edge_item->setZValue(0.0);
+            }
+        }
+    }
+
     QRectF compute_scene_rect(const satgraf::layout::CoordinateMap& coords,
                               double margin = 50.0) const
     {
@@ -526,6 +611,88 @@ public:
     size_t node_count() const { return node_items_.size(); }
     size_t edge_count() const { return edge_items_.size(); }
 
+    void set_community_click_callback(std::function<void(uint32_t)> cb) {
+        community_click_callback_ = std::move(cb);
+    }
+
+    void render_simple_2d(
+        const std::vector<satgraf::layout::Coordinate>& centers,
+        const std::vector<std::size_t>& community_sizes,
+        const std::vector<uint32_t>& community_ids,
+        const std::map<std::pair<uint32_t, uint32_t>, double>& inter_community_edges,
+        const std::unordered_map<uint32_t, QColor>& community_colors,
+        double node_size,
+        double avg_community_size,
+        double edge_width = 1.0)
+    {
+        scene_->clear();
+        node_items_.clear();
+        edge_items_.clear();
+        community_regions_.clear();
+        decision_highlight_ = nullptr;
+        stored_graph_ = nullptr;
+
+        for (const auto& [pair, weight] : inter_community_edges) {
+            QPointF from, to;
+            bool found_from = false, found_to = false;
+            for (size_t i = 0; i < community_ids.size(); ++i) {
+                if (community_ids[i] == pair.first) {
+                    from = QPointF(centers[i].x, centers[i].y);
+                    found_from = true;
+                }
+                if (community_ids[i] == pair.second) {
+                    to = QPointF(centers[i].x, centers[i].y);
+                    found_to = true;
+                }
+            }
+            if (!found_from || !found_to) continue;
+
+            double pen_width = edge_width * std::max(1.0, std::log(weight + 1.0) * 2.0);
+            auto* line = new QGraphicsLineItem(from.x(), from.y(), to.x(), to.y());
+            QPen pen(QBrush(QColor(180, 180, 180, 160)), pen_width);
+            line->setPen(pen);
+            line->setZValue(0.0);
+            scene_->addItem(line);
+
+            QPointF mid = (from + to) / 2.0;
+            auto* weight_label = new QGraphicsTextItem(
+                QString::number(static_cast<int>(weight)));
+            weight_label->setPos(mid);
+            QFont f;
+            f.setPointSize(8);
+            weight_label->setFont(f);
+            weight_label->setDefaultTextColor(QColor(200, 200, 200));
+            weight_label->setZValue(0.5);
+            scene_->addItem(weight_label);
+        }
+
+        for (size_t i = 0; i < community_ids.size(); ++i) {
+            uint32_t cid = community_ids[i];
+            QPointF center(centers[i].x, centers[i].y);
+            double diameter = node_size * 2.0
+                * std::sqrt(static_cast<double>(community_sizes[i]) / avg_community_size);
+
+            auto color_it = community_colors.find(cid);
+            QColor color = (color_it != community_colors.end())
+                ? color_it->second : QColor(200, 200, 200);
+
+            auto* ellipse = new CommunityEllipseItem(
+                cid, center, diameter, color, community_click_callback_);
+            scene_->addItem(ellipse);
+
+            auto* label = new QGraphicsTextItem(
+                QString("C%1\n%2 nodes").arg(cid).arg(community_sizes[i]));
+            label->setPos(center.x() + diameter / 2.0 + 4, center.y() - 12);
+            label->setZValue(2.0);
+            QFont f;
+            f.setPointSize(9);
+            f.setBold(true);
+            label->setFont(f);
+            label->setDefaultTextColor(QColor(220, 220, 220));
+            scene_->addItem(label);
+        }
+    }
+
 private:
     QGraphicsScene* scene_;
     std::unordered_map<satgraf::graph::NodeId, NodeGraphicsItem*> node_items_;
@@ -533,6 +700,7 @@ private:
     std::unordered_map<uint32_t, CommunityRegionItem*> community_regions_;
     DecisionHighlightItem* decision_highlight_{nullptr};
     const Graph* stored_graph_{nullptr};
+    std::function<void(uint32_t)> community_click_callback_;
 };
 
 }  // namespace satgraf::rendering

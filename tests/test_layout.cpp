@@ -613,3 +613,67 @@ TEST_CASE("fgpu is in available algorithms", "[layout][factory]") {
     REQUIRE(std::find(names.begin(), names.end(), "grid") != names.end());
     REQUIRE(std::find(names.begin(), names.end(), "gkk") != names.end());
 }
+
+TEST_CASE("ForceAtlas3D compute3D returns correct number of 3D coordinates", "[layout][fa3d]") {
+    ForceAtlas3DLayout layout;
+    const auto graph = make_cluster_graph();
+
+    const auto coords3d = layout.compute3D(graph);
+
+    REQUIRE(coords3d.size() == graph.nodeCount());
+    for (const auto& [node_id, node] : graph.getNodes()) {
+        (void)node;
+        const auto it = coords3d.find(node_id);
+        REQUIRE(it != coords3d.end());
+        REQUIRE(std::isfinite(it->second.x));
+        REQUIRE(std::isfinite(it->second.y));
+        REQUIRE(std::isfinite(it->second.z));
+    }
+}
+
+TEST_CASE("ForceAtlas3D positions are non-degenerate for connected graphs", "[layout][fa3d]") {
+    ForceAtlas3DLayout layout(120, 1024.0, 1024.0, 1024.0);
+    const auto graph = make_cluster_graph();
+
+    const auto coords3d = layout.compute3D(graph);
+
+    std::set<std::tuple<long long, long long, long long>> unique_positions;
+    for (const auto& [node_id, c3d] : coords3d) {
+        (void)node_id;
+        REQUIRE(std::isfinite(c3d.x));
+        REQUIRE(std::isfinite(c3d.y));
+        REQUIRE(std::isfinite(c3d.z));
+        unique_positions.emplace(
+            static_cast<long long>(std::llround(c3d.x * 1000.0)),
+            static_cast<long long>(std::llround(c3d.y * 1000.0)),
+            static_cast<long long>(std::llround(c3d.z * 1000.0)));
+    }
+
+    REQUIRE(unique_positions.size() == graph.nodeCount());
+}
+
+TEST_CASE("ForceAtlas3D compute override returns valid 2D coordinates", "[layout][fa3d]") {
+    ForceAtlas3DLayout layout;
+    const auto graph = make_cluster_graph();
+
+    const auto coords2d = layout.compute(graph);
+
+    REQUIRE(coords2d.size() == graph.nodeCount());
+    for (const auto& [node_id, node] : graph.getNodes()) {
+        (void)node;
+        const auto it = coords2d.find(node_id);
+        REQUIRE(it != coords2d.end());
+        REQUIRE(std::isfinite(it->second.x));
+        REQUIRE(std::isfinite(it->second.y));
+        REQUIRE(it->second.x >= 0.0);
+        REQUIRE(it->second.x <= 1024.0);
+        REQUIRE(it->second.y >= 0.0);
+        REQUIRE(it->second.y <= 1024.0);
+    }
+}
+
+TEST_CASE("fa3d is registered in factory", "[layout][factory]") {
+    auto layout = LayoutFactory::instance().create("fa3d");
+    REQUIRE(layout != nullptr);
+    REQUIRE(dynamic_cast<ForceAtlas3DLayout*>(layout.get()) != nullptr);
+}
