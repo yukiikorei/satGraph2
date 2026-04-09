@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=SatGraf
+Comment=SAT solver visualization tool
+Exec=satgraf %F
+Icon=satgraf
+Terminal=false
+Categories=Science;Education;Qt;
+MimeType=application/x-dimacs;
+Keywords=SAT;graph;visualization;community;

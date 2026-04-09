@@ -1,15 +1,25 @@
-# satGraf
+# satGraf2
 
-A C++17 rewrite of [satGraf](https://github.com/Vignesh-Desmond/satGraf) — a visualization tool for SAT solver instances and their runtime evolution. It parses DIMACS CNF files, detects variable communities, computes force-directed graph layouts (CPU and GPU via OpenCL), and renders interactive visualizations with a Qt 6 GUI or headless image export.
+A C++17 rewrite of [SATGraf](https://github.com/ekuiter/SATGraf) — a visualization tool for SAT solver instances and their runtime evolution. This project is based on the research from [MapleSAT publications](https://maplesat.github.io/publications). It parses DIMACS CNF files, detects variable communities, computes force-directed graph layouts (CPU and GPU via OpenCL), and renders interactive visualizations with a Qt 6 GUI or headless image export.
 
 ## Features
+
+### What's New Over Original SATGraf
+
+- **Four rendering modes** — Detailed 2D (per-node), Simple 2D (quotient graph), full 3D (OpenGL with arcball rotation), and Simple 3D (quotient graph spheres)
+- **ForceAtlas3D layout** — extends ForceAtlas2 forces (repulsion, attraction, gravity) into 3D space for spatial graph visualization
+- **Interactive 3D community highlighting** — select a community to highlight its nodes/edges with brightness and size scaling; linked nodes in neighboring communities are highlighted individually (not the entire community)
+- **Enriched info panel** — graph-level internal/external edge counts, per-community detail (bridge nodes, linked communities), per-node detail (internal/external neighbors, linked communities), all in consistent QFormLayout grids
+- **Node text search** — type a node ID or name to select and highlight it, as an alternative to click selection
+- **Configurable edge size** — edge width slider affects all four rendering modes
+- **DEB packaging** — one-command `cpack` produces a `.deb` with desktop entry, hicolor icons (PNG + SVG), and dependency declarations
 
 ### Core Library (header-only)
 
 - **DIMACS CNF parser** — reads standard DIMACS format into a variable interaction graph (VIG) or literal interaction graph (LIG)
 - **Graph model** — typed graph with nodes, edges, community IDs, and variable assignment tracking
 - **Community detection** — Louvain and CNM algorithms (via igraph) with factory-based registration
-- **Layout engine (CPU)** — Fruchterman-Reingold, Kamada-Kawai, ForceAtlas2, and community-aware variants (circular, grid, grid-KK)
+- **Layout engine (CPU)** — Fruchterman-Reingold, Kamada-Kawai, ForceAtlas2, ForceAtlas3D, and community-aware variants (circular, grid, grid-KK)
 - **Layout engine (GPU)** — OpenCL-accelerated Fruchterman-Reingold with automatic CPU fallback
 - **SAT solver integration** — spawns external solvers via named FIFOs (POSIX), parses the `v`/`c`/`!` event protocol, with RAII process management and crash detection
 - **Evolution engine** — forward/backward replay of solver events, conflict scanning, decision variable tracking, observer pattern for real-time UI updates, file buffering with background threads
@@ -17,16 +27,24 @@ A C++17 rewrite of [satGraf](https://github.com/Vignesh-Desmond/satGraf) — a v
 ### GUI (Qt 6)
 
 - **Split pane window** — 70/30 canvas/control panel with resizable divider
+- **Four rendering modes** — switch between Detailed 2D, Simple 2D (quotient graph), 3D (full graph, OpenGL), and Simple 3D (quotient spheres) from a dropdown
 - **Menu bar** — File (Open, Export), View (Zoom In/Out/Fit), Help (About)
-- **Community mode controls** — community algorithm dropdown, layout algorithm dropdown, iteration slider
+- **Community mode controls** — community algorithm dropdown, layout algorithm dropdown, iteration slider (1–500), node size slider (1–25), edge size slider (1–10)
 - **Evolution mode controls** — solver binary selector with path persistence (QSettings), step forward/backward buttons, conflict counter, timeline slider
-- **Info panel** — node count, edge count, community count, modularity score
-- **Interactive rendering** — zoom/pan via mouse wheel and drag, node click detection, scale-aware label visibility
+- **Enriched info panel** — graph statistics (nodes, edges, communities, modularity, internal/external edges), community detail (nodes, bridge nodes, internal/external edges, linked communities), node detail (ID, community, internal/external neighbors, linked communities)
+- **Community selection** — dropdown or click to select a community; highlight toggle checkbox; z-order promotion in 2D, brightness/size highlighting in 3D
+- **Node search** — text input for node selection by ID or name, synced with click selection
+- **Interactive rendering** — zoom/pan via mouse wheel and drag, node click detection, scale-aware label visibility, arcball rotation + scroll zoom in 3D modes
 
 ### Rendering
 
-- **Layered rendering** — edges (z=0), community regions (z=0.5), nodes (z=1), labels (z=2), decision highlight (z=3)
+- **Four rendering modes:**
+  - *Detailed 2D* — per-node rendering with layered z-order (edges z=0, community regions z=0.5, nodes z=1, labels z=2, decision highlight z=3)
+  - *Simple 2D* — quotient graph: one circle per community, sized by node count, edges weighted by inter-community edge count
+  - *3D* — full graph rendered with OpenGL (QOpenGLWidget), ForceAtlas3D layout, per-node spheres with community coloring, arcball rotation, scroll zoom
+  - *Simple 3D* — quotient graph in 3D: community spheres sized by node count, weighted inter-community edges, perspective projection
 - **Community coloring** — 20-color palette for intra-community edges/nodes, gray for inter-community, red dashed for conflict edges
+- **3D community highlighting** — selected community nodes rendered at full brightness with 1.3× radius; linked neighbor-community nodes highlighted individually; all other nodes dimmed to 0.1 alpha
 - **Visibility filters** — hide/show by community, assignment state, or edge type
 
 ### Export
@@ -57,17 +75,17 @@ Options:
 
 ## Dependencies
 
-| Library | Version | Purpose |
-|---------|---------|---------|
-| CMake | ≥ 3.21 | Build system |
-| C++ compiler | C++17 | GCC 11+, Clang 14+, MSVC 2022+ |
-| igraph | ≥ 0.10 | Community detection (Louvain, CNM) |
-| Qt 6 | Core, Gui, Widgets, Qml, Quick | GUI and image rendering |
-| OpenCL | ≥ 1.2 | GPU-accelerated layout |
-| Eigen3 | ≥ 3.4 | Matrix operations for layout algorithms |
-| nlohmann_json | ≥ 3.0 | JSON serialization |
-| CLI11 | ≥ 2.3 | Command-line argument parsing |
-| Catch2 | ≥ 3.0 | Unit testing framework |
+| Library       | Version                        | Purpose                                 |
+| ------------- | ------------------------------ | --------------------------------------- |
+| CMake         | ≥ 3.21                         | Build system                            |
+| C++ compiler  | C++17                          | GCC 11+, Clang 14+, MSVC 2022+          |
+| igraph        | ≥ 0.10                         | Community detection (Louvain, CNM)      |
+| Qt 6          | Core, Gui, Widgets, OpenGL, OpenGLWidgets, Qml, Quick | GUI, 3D rendering, and image rendering |
+| OpenCL        | ≥ 1.2                          | GPU-accelerated layout                  |
+| Eigen3        | ≥ 3.4                          | Matrix operations for layout algorithms |
+| nlohmann_json | ≥ 3.0                          | JSON serialization                      |
+| CLI11         | ≥ 2.3                          | Command-line argument parsing           |
+| Catch2        | ≥ 3.0                          | Unit testing framework                  |
 
 ### Install dependencies (Ubuntu 24.04)
 
@@ -136,12 +154,12 @@ ctest --test-dir build --output-on-failure
 QT_QPA_PLATFORM=offscreen ./build/tests/satgraf_gui_tests
 ```
 
-**126 tests** covering graph model, DIMACS parsing, community detection, layout algorithms (CPU and GPU), solver integration, evolution engine, rendering, export, and end-to-end pipelines.
+**130 tests** covering graph model, DIMACS parsing, community detection, layout algorithms (CPU and GPU), 3D layout, solver integration, evolution engine, rendering, export, and end-to-end pipelines.
 
 ## Project Structure
 
 ```
-satGraf-rebuild/
+satGraf2/
 ├── CMakeLists.txt
 ├── src/
 │   ├── core/include/satgraf/     # Header-only core library
@@ -157,6 +175,7 @@ satGraf-rebuild/
 │   │   └── ...
 │   ├── gui/include/satgraf_gui/  # Qt GUI module
 │   │   ├── graph_renderer.hpp    # QGraphicsScene renderer + GraphView
+│   │   ├── graph_view_3d.hpp     # OpenGL 3D widget (QOpenGLWidget)
 │   │   ├── export.hpp            # QImage-based static/animated export
 │   │   └── main_window.hpp       # Main window with control panels
 │   └── app/
@@ -173,6 +192,33 @@ satGraf-rebuild/
 └── openspec/                     # OpenSpec change tracking
 ```
 
+## AI-Driven Development
+
+This project is **entirely AI-generated** and developed using the [OpenSpec](https://github.com/openspec-dev/openspec) specification-driven workflow. All significant features are implemented through a structured process:
+
+1. **Proposal** — describe the change intent
+2. **Design** — document the technical approach
+3. **Specs** — define requirements and acceptance scenarios per capability
+4. **Tasks** — break down into atomic, verifiable implementation steps
+5. **Implement** — execute tasks against the spec
+6. **Archive** — sync delta specs back to main specs and archive the change
+
+No feature is merged without corresponding spec updates. The `openspec/` directory in this repository contains the full change history, including proposals, designs, specs, and task tracking for every feature.
+
+```
+openspec/
+├── specs/                  # Current capability specifications
+│   ├── gui/spec.md
+│   ├── rendering/spec.md
+│   ├── rendering-modes/spec.md
+│   ├── layout-engine/spec.md
+│   ├── community-z-order/spec.md
+│   ├── node-text-selection/spec.md
+│   └── info-panel-enrichment/spec.md
+└── changes/archive/        # Completed change histories
+    └── 2026-04-09-enrich-info-panel/
+```
+
 ## Architecture
 
 ```
@@ -187,4 +233,6 @@ DIMACS CNF → Parser → Graph → Community Detector → Layout Engine → Ren
 
 ## License
 
-This project is a C++ rewrite of the original Java [satGraf](https://github.com/Vignesh-Desmond/satGraf) by Vignesh Desmond.
+This project is licensed under the [MIT License](LICENSE) by Jinghu LIANG.
+
+It is a C++ rewrite of the original Java [SATGraf](https://github.com/ekuiter/SATGraf), based on research from [MapleSAT publications](https://maplesat.github.io/publications).

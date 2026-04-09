@@ -69,3 +69,10 @@ When evolution mode is active, the rendering mode SHALL be forced to "2D" becaus
 #### Scenario: Evolution forces 2D
 - **WHEN** the user starts the solver in evolution mode while Simple 2D or 3D is selected
 - **THEN** the rendering mode switches to "2D" and Simple 2D/3D options are disabled until the solver stops
+
+### Requirement: Background Post-Layout Computation
+Post-layout computations (quotient graph construction, community FA2 centers, FA3D layouts) SHALL execute in the background render thread, not on the GUI thread. The `perform_render()` method SHALL only use pre-computed data to set up the view.
+
+#### Scenario: Switching to 3D mode after render
+- **WHEN** the user switches from Detailed 2D to 3D mode after a render completes
+- **THEN** the 3D view displays immediately using pre-computed `coords_3d_` data, with no recomputation delay

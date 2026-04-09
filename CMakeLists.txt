@@ -4,6 +4,7 @@ project(satgraf VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # --- Dependencies ---
 find_package(igraph REQUIRED)
@@ -29,6 +30,9 @@ add_subdirectory(tests)
 
 # --- CPack DEB packaging ---
 install(TARGETS satgraf RUNTIME DESTINATION bin)
+install(FILES icon.png DESTINATION share/icons/hicolor/1024x1024/apps RENAME satgraf.png)
+install(FILES icon.svg DESTINATION share/icons/hicolor/scalable/apps RENAME satgraf.svg)
+install(FILES satgraf.desktop DESTINATION share/applications)
 
 set(CPACK_GENERATOR "DEB")
 set(CPACK_PACKAGE_NAME "satgraf")
@@ -38,10 +42,10 @@ set(CPACK_PACKAGE_DESCRIPTION "Interactive graph-based visualization for SAT sol
 community structure and variable evolution. Supports multiple layout algorithms
 (Fruchterman-Reingold, ForceAtlas2, Grid), community detection (Louvain, Label
 Propagation), and real-time solver event tracking via external solver integration.")
-set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/user/satgraf")
-set(CPACK_PACKAGE_CONTACT "satgraf@example.com")
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/ekuiter/SATGraf")
+set(CPACK_PACKAGE_CONTACT "Jinghu Liang")
 set(CPACK_PACKAGE_LICENSE "MIT")
-set(CPACK_DEBIAN_PACKAGE_MAINTAINER "satgraf <satgraf@example.com>")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Jinghu Liang")
 set(CPACK_DEBIAN_PACKAGE_SECTION "science")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
 set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
