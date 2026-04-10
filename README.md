@@ -107,6 +107,39 @@ cmake --build build -j$(nproc)
 
 The main executable is at `build/src/app/satgraf`.
 
+### macOS one-shot build/dependency setup
+
+On macOS, run:
+
+```bash
+./build_macos.sh
+```
+
+This script:
+- installs missing Homebrew dependencies (`igraph`, `qt`, `eigen`, `nlohmann-json`, `cli11`, `catch2`, etc.)
+- configures and builds `satgraf` in `build-macos`
+- runs tests
+- runs CPack and checks that a `.dmg` package contains `satgraf.app`
+- runs a smoke check via `satgraf.app/Contents/MacOS/satgraf --help`
+
+Useful toggles:
+
+```bash
+RUN_TESTS=0 RUN_PACKAGE=0 ./build_macos.sh
+BUILD_DIR=build-macos-debug BUILD_TYPE=Debug ./build_macos.sh
+```
+
+### Linux compatibility regression check
+
+Use the standard Linux flow to verify non-macOS paths remain valid:
+
+```bash
+cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release
+cmake --build build-linux -j$(nproc)
+ctest --test-dir build-linux --output-on-failure
+./build-linux/src/app/satgraf --help
+```
+
 ## Usage
 
 ### Interactive GUI

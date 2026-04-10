@@ -15,6 +15,7 @@
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
+#include <QActionGroup>
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QScrollArea>
@@ -36,6 +37,8 @@
 #include <QWindow>
 #include <QPainter>
 #include <QPainterPath>
+#include <QStyleHints>
+#include <QtGlobal>
 #include <numeric>
 #include <string>
 #include <memory>
@@ -124,6 +127,8 @@ private:
 };
 
 enum class RenderMode { Detailed2D, Simple2D, Mode3D, Simple3D };
+enum class UiTheme { Dark, Light };
+enum class ThemeMode { FollowSystem, ForceDark, ForceLight };
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -133,21 +138,60 @@ public:
     {
         setWindowTitle("satGraf");
         resize(1440, 900);
+        load_theme_mode();
+#ifdef Q_OS_MACOS
+        setUnifiedTitleAndToolBarOnMac(true);
+#else
         setWindowFlag(Qt::FramelessWindowHint);
         setAttribute(Qt::WA_TranslucentBackground);
+#endif
 
         setup_menus();
         setup_central_widget();
 
         statusBar()->hide();
+#ifdef Q_OS_MACOS
+        menuBar()->setNativeMenuBar(true);
+        if (qApp && qApp->styleHints()) {
+            connect(qApp->styleHints(), &QStyleHints::colorSchemeChanged,
+                    this, [this](Qt::ColorScheme) {
+                if (theme_mode_ == ThemeMode::FollowSystem) {
+                    apply_current_theme();
+                }
+            });
+        }
+#else
         menuBar()->hide();
+#endif
+        apply_current_theme();
+    }
+
+    ~MainWindow() override {
+        render_cancel_.store(true);
+        rendering_active_.store(false);
+
+        solver_.cancel();
+        if (solver_timer_) {
+            solver_timer_->stop();
+            solver_timer_->deleteLater();
+            solver_timer_ = nullptr;
+        }
+
+        if (render_thread_ && render_thread_->joinable()) {
+            render_thread_->join();
+        }
+        render_thread_.reset();
     }
 
     void resizeEvent(QResizeEvent*) override {
+#ifndef Q_OS_MACOS
         QPainterPath path;
         path.addRoundedRect(rect(), 10, 10);
         QRegion mask = QRegion(path.toFillPolygon().toPolygon());
         setMask(mask);
+#else
+        clearMask();
+#endif
     }
 
 signals:
@@ -843,6 +887,75 @@ private:
         return entry;
     }
 
+    void load_theme_mode() {
+        QSettings settings("satgraf", "satGraf");
+        const auto mode = settings.value("ui/theme_mode", "system").toString();
+        if (mode == "dark") {
+            theme_mode_ = ThemeMode::ForceDark;
+        } else if (mode == "light") {
+            theme_mode_ = ThemeMode::ForceLight;
+        } else {
+            theme_mode_ = ThemeMode::FollowSystem;
+        }
+    }
+
+    void save_theme_mode() {
+        QSettings settings("satgraf", "satGraf");
+        QString mode = "system";
+        if (theme_mode_ == ThemeMode::ForceDark) mode = "dark";
+        if (theme_mode_ == ThemeMode::ForceLight) mode = "light";
+        settings.setValue("ui/theme_mode", mode);
+    }
+
+    UiTheme detect_system_theme() const {
+#ifdef Q_OS_MACOS
+        if (qApp && qApp->styleHints()) {
+            const auto cs = qApp->styleHints()->colorScheme();
+            if (cs == Qt::ColorScheme::Light) return UiTheme::Light;
+            return UiTheme::Dark;
+        }
+#endif
+        return UiTheme::Dark;
+    }
+
+    UiTheme resolve_theme() const {
+        if (qApp && qApp->styleHints()) {
+            const auto cs = qApp->styleHints()->colorScheme();
+            if (cs == Qt::ColorScheme::Light) return UiTheme::Light;
+            if (cs == Qt::ColorScheme::Dark) return UiTheme::Dark;
+        }
+        return detect_system_theme();
+    }
+
+    void apply_color_scheme_override() {
+        if (!qApp || !qApp->styleHints()) return;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
+        if (theme_mode_ == ThemeMode::ForceDark) {
+            qApp->styleHints()->setColorScheme(Qt::ColorScheme::Dark);
+        } else if (theme_mode_ == ThemeMode::ForceLight) {
+            qApp->styleHints()->setColorScheme(Qt::ColorScheme::Light);
+        } else {
+            qApp->styleHints()->setColorScheme(Qt::ColorScheme::Unknown);
+        }
+#endif
+    }
+
+    void apply_current_theme() {
+        apply_color_scheme_override();
+        active_theme_ = resolve_theme();
+        if (central_widget_) apply_platform_style(central_widget_);
+
+        if (theme_follow_system_action_) theme_follow_system_action_->setChecked(theme_mode_ == ThemeMode::FollowSystem);
+        if (theme_dark_action_) theme_dark_action_->setChecked(theme_mode_ == ThemeMode::ForceDark);
+        if (theme_light_action_) theme_light_action_->setChecked(theme_mode_ == ThemeMode::ForceLight);
+    }
+
+    void set_theme_mode(ThemeMode mode) {
+        theme_mode_ = mode;
+        save_theme_mode();
+        apply_current_theme();
+    }
+
     void setup_menus() {
         auto* file_menu = menuBar()->addMenu("File");
         file_menu->addAction("Open...", QKeySequence::Open, this, &MainWindow::open_file);
@@ -852,6 +965,7 @@ private:
         file_menu->addAction("Quit", QKeySequence::Quit, this, &QWidget::close);
 
         auto* view_menu = menuBar()->addMenu("View");
+#ifndef Q_OS_MACOS
         auto* menubar_action = view_menu->addAction("Show Menu Bar");
         menubar_action->setCheckable(true);
         menubar_action->setChecked(false);
@@ -859,6 +973,21 @@ private:
         connect(menubar_action, &QAction::toggled, this, [this](bool on) {
             menuBar()->setVisible(on);
         });
+#endif
+        view_menu->addSeparator();
+        auto* theme_menu = view_menu->addMenu("Theme");
+        auto* theme_group = new QActionGroup(this);
+        theme_group->setExclusive(true);
+        theme_follow_system_action_ = theme_menu->addAction("Follow System");
+        theme_dark_action_ = theme_menu->addAction("Dark");
+        theme_light_action_ = theme_menu->addAction("Light");
+        for (auto* action : {theme_follow_system_action_, theme_dark_action_, theme_light_action_}) {
+            action->setCheckable(true);
+            theme_group->addAction(action);
+        }
+        connect(theme_follow_system_action_, &QAction::triggered, this, [this]() { set_theme_mode(ThemeMode::FollowSystem); });
+        connect(theme_dark_action_, &QAction::triggered, this, [this]() { set_theme_mode(ThemeMode::ForceDark); });
+        connect(theme_light_action_, &QAction::triggered, this, [this]() { set_theme_mode(ThemeMode::ForceLight); });
         view_menu->addSeparator();
         view_menu->addAction("Zoom In", QKeySequence::ZoomIn, this, &MainWindow::zoom_in);
         view_menu->addAction("Zoom Out", QKeySequence::ZoomOut, this, &MainWindow::zoom_out);
@@ -871,19 +1000,29 @@ private:
     void setup_central_widget() {
         auto* central = new QWidget(this);
         central->setObjectName("central");
-        central->setStyleSheet(
-            "#central { background: palette(window); border-radius: 10px; }");
+        central_widget_ = central;
+        apply_platform_style(central);
         auto* top_layout = new QVBoxLayout(central);
-        top_layout->setContentsMargins(1, 1, 1, 1);
+        top_layout->setContentsMargins(0, 0, 0, 0);
         top_layout->setSpacing(0);
 
+#ifndef Q_OS_MACOS
         title_bar_ = new TitleBar(this, central);
         top_layout->addWidget(title_bar_);
+#endif
 
         auto* main_splitter = new QSplitter(Qt::Horizontal, central);
+        main_splitter_ = main_splitter;
+#ifdef Q_OS_MACOS
+        main_splitter->setHandleWidth(3);
+        main_splitter->setStyleSheet(
+            "QSplitter::handle { background: transparent; width: 3px; }");
+#endif
 
         renderer_ = new rendering::GraphRenderer(this);
         view_ = new rendering::GraphView(renderer_->scene(), this);
+        view_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        view_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         bg_brush_ = QBrush(Qt::black);
         view_->setBackgroundBrush(bg_brush_);
         view_->scene()->setBackgroundBrush(bg_brush_);
@@ -917,6 +1056,8 @@ private:
 
         auto* left_panel = build_left_panel();
         auto* right_panel = build_right_panel();
+        left_panel_ = left_panel;
+        right_panel_ = right_panel;
 
         main_splitter->addWidget(left_panel);
         main_splitter->addWidget(view_);
@@ -938,8 +1079,9 @@ private:
 
     QWidget* build_left_panel() {
         auto* panel = new QWidget(this);
+        panel->setObjectName("left-panel");
         auto* layout = new QVBoxLayout(panel);
-        layout->setContentsMargins(16, 16, 16, 16);
+        layout->setContentsMargins(14, 12, 14, 12);
         layout->setSpacing(10);
 
         file_label_ = new QLabel("No file loaded", this);
@@ -1077,7 +1219,7 @@ private:
         layout->addWidget(separator());
 
         render_btn_ = new QPushButton("▶  Render", this);
-        render_btn_->setMinimumHeight(36);
+        render_btn_->setObjectName("render-btn");
         render_btn_->setEnabled(false);
         connect(render_btn_, &QPushButton::clicked, this, &MainWindow::render_graph);
         layout->addWidget(render_btn_);
@@ -1112,6 +1254,7 @@ private:
         }());
 
         start_solver_btn_ = new QPushButton("▶  Start Solver", this);
+        start_solver_btn_->setObjectName("solver-btn");
         start_solver_btn_->setEnabled(false);
         connect(start_solver_btn_, &QPushButton::clicked, this, &MainWindow::start_solver);
         layout->addWidget(start_solver_btn_);
@@ -1144,32 +1287,26 @@ private:
 
     QWidget* build_right_panel() {
         auto* panel = new QWidget(this);
+        panel->setObjectName("right-panel");
         auto* layout = new QVBoxLayout(panel);
-        layout->setContentsMargins(16, 16, 16, 16);
+        layout->setContentsMargins(14, 12, 14, 12);
         layout->setSpacing(6);
 
         auto* stats_title = new QLabel("<b>Statistics</b>", this);
         layout->addWidget(stats_title);
 
         auto* stats_grid = new QFormLayout();
-        stats_grid->setSpacing(4);
-        stats_grid->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-        stats_nodes_ = new QLabel("0", this);
-        stats_nodes_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        stats_edges_ = new QLabel("0", this);
-        stats_edges_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        stats_communities_ = new QLabel("—", this);
-        stats_communities_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        stats_modularity_ = new QLabel("—", this);
-        stats_modularity_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        configure_info_form(stats_grid);
+        stats_nodes_ = make_info_value_label("0");
+        stats_edges_ = make_info_value_label("0");
+        stats_communities_ = make_info_value_label("—");
+        stats_modularity_ = make_info_value_label("—");
         stats_grid->addRow("Nodes:", stats_nodes_);
         stats_grid->addRow("Edges:", stats_edges_);
         stats_grid->addRow("Communities:", stats_communities_);
         stats_grid->addRow("Modularity:", stats_modularity_);
-        stats_internal_edges_ = new QLabel("—", this);
-        stats_internal_edges_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        stats_external_edges_ = new QLabel("—", this);
-        stats_external_edges_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        stats_internal_edges_ = make_info_value_label("—");
+        stats_external_edges_ = make_info_value_label("—");
         stats_grid->addRow("Internal Edges:", stats_internal_edges_);
         stats_grid->addRow("External Edges:", stats_external_edges_);
         layout->addLayout(stats_grid);
@@ -1205,18 +1342,12 @@ private:
         comm_inner->addWidget(highlight_check_);
 
         auto* comm_grid = new QFormLayout();
-        comm_grid->setSpacing(4);
-        comm_grid->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-        comm_nodes_label_ = new QLabel("—", this);
-        comm_nodes_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        comm_bridge_label_ = new QLabel("—", this);
-        comm_bridge_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        comm_internal_edges_label_ = new QLabel("—", this);
-        comm_internal_edges_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        comm_external_edges_label_ = new QLabel("—", this);
-        comm_external_edges_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        comm_linked_label_ = new QLabel("—", this);
-        comm_linked_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        configure_info_form(comm_grid);
+        comm_nodes_label_ = make_info_value_label("—");
+        comm_bridge_label_ = make_info_value_label("—");
+        comm_internal_edges_label_ = make_info_value_label("—");
+        comm_external_edges_label_ = make_info_value_label("—");
+        comm_linked_label_ = make_info_value_label("—");
         comm_grid->addRow("Nodes:", comm_nodes_label_);
         comm_grid->addRow("Bridge Nodes:", comm_bridge_label_);
         comm_grid->addRow("Internal Edges:", comm_internal_edges_label_);
@@ -1228,9 +1359,11 @@ private:
         comm_inner->addWidget(neighbor_label);
 
         auto* neighbor_scroll = new QScrollArea(this);
+        neighbor_scroll->setObjectName("info-scroll");
         neighbor_scroll->setWidgetResizable(true);
         neighbor_scroll->setMaximumHeight(120);
         neighbor_list_container_ = new QWidget(this);
+        neighbor_list_container_->setObjectName("info-list-container");
         neighbor_list_layout_ = new QVBoxLayout(neighbor_list_container_);
         neighbor_list_layout_->setContentsMargins(0, 0, 0, 0);
         neighbor_list_layout_->setSpacing(2);
@@ -1257,18 +1390,12 @@ private:
         var_inner->addWidget(node_search_edit_);
 
         auto* node_grid = new QFormLayout();
-        node_grid->setSpacing(4);
-        node_grid->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-        node_id_label_ = new QLabel("—", this);
-        node_id_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        node_community_label_ = new QLabel("—", this);
-        node_community_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        node_int_nbr_label_ = new QLabel("—", this);
-        node_int_nbr_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        node_ext_nbr_label_ = new QLabel("—", this);
-        node_ext_nbr_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        node_linked_label_ = new QLabel("—", this);
-        node_linked_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        configure_info_form(node_grid);
+        node_id_label_ = make_info_value_label("—");
+        node_community_label_ = make_info_value_label("—");
+        node_int_nbr_label_ = make_info_value_label("—");
+        node_ext_nbr_label_ = make_info_value_label("—");
+        node_linked_label_ = make_info_value_label("—");
         node_grid->addRow("Node:", node_id_label_);
         node_grid->addRow("Community:", node_community_label_);
         node_grid->addRow("Internal Neighbors:", node_int_nbr_label_);
@@ -1280,6 +1407,7 @@ private:
         var_inner->addWidget(clause_label);
 
         clause_display_ = new QWidget(this);
+        clause_display_->setObjectName("info-list-container");
         auto* clause_vlayout = new QVBoxLayout(clause_display_);
         clause_vlayout->setContentsMargins(0, 0, 0, 0);
         clause_vlayout->setSpacing(8);
@@ -1290,6 +1418,7 @@ private:
         pos_section_layout->setSpacing(2);
         pos_section_layout->addWidget(new QLabel("<b>Pos Clauses</b>", this));
         auto* pos_scroll = new QScrollArea(this);
+        pos_scroll->setObjectName("info-scroll");
         pos_scroll->setWidgetResizable(true);
         pos_scroll->setMaximumHeight(300);
         auto* pos_inner_widget = new QWidget(this);
@@ -1307,6 +1436,7 @@ private:
         neg_section_layout->setSpacing(2);
         neg_section_layout->addWidget(new QLabel("<b>Neg Clauses</b>", this));
         auto* neg_scroll = new QScrollArea(this);
+        neg_scroll->setObjectName("info-scroll");
         neg_scroll->setWidgetResizable(true);
         neg_scroll->setMaximumHeight(300);
         auto* neg_inner_widget = new QWidget(this);
@@ -1328,17 +1458,71 @@ private:
         layout->addWidget(separator());
 
         log_label_ = new QLabel("Ready", this);
+        log_label_->setObjectName("log-label");
         log_label_->setWordWrap(true);
         log_label_->setAlignment(Qt::AlignBottom | Qt::AlignLeft);
         layout->addWidget(log_label_);
         return panel;
     }
 
+    void apply_platform_style(QWidget* central) {
+#ifdef Q_OS_MACOS
+        const QString sheet = QStringLiteral(
+            "#central { background: palette(window); }"
+            "#left-panel, #right-panel {"
+            "  background: palette(base);"
+            "  border: 1px solid palette(mid);"
+            "  border-radius: 8px;"
+            "  margin-left: -3px;"
+            "  margin-right: -3px;"
+            "}"
+            "QFrame#panel-separator {"
+            "  background: palette(mid);"
+            "  border: none;"
+            "  min-height: 1px;"
+            "  max-height: 1px;"
+            "}"
+            "#log-label {"
+            "  background: palette(base);"
+            "  color: palette(text);"
+            "  border: 1px solid palette(mid);"
+            "  border-radius: 6px;"
+            "  padding: 8px;"
+            "}"
+            "QScrollArea, #info-list-container, #info-scroll QWidget {"
+            "  background: palette(base);"
+            "  color: palette(text);"
+            "}");
+        central->setStyleSheet(sheet);
+#else
+        central->setStyleSheet(
+            "#central { background: palette(window); border-radius: 10px; }");
+#endif
+    }
+
     QFrame* separator() {
         auto* line = new QFrame(this);
+        line->setObjectName("panel-separator");
         line->setFrameShape(QFrame::HLine);
         line->setFrameShadow(QFrame::Sunken);
         return line;
+    }
+
+    QLabel* make_info_value_label(const QString& text = QStringLiteral("—")) {
+        auto* lbl = new QLabel(text, this);
+        lbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        lbl->setMinimumWidth(96);
+        lbl->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        return lbl;
+    }
+
+    void configure_info_form(QFormLayout* form) {
+        form->setSpacing(4);
+        form->setHorizontalSpacing(10);
+        form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        form->setFormAlignment(Qt::AlignTop | Qt::AlignLeft);
+        form->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
+        form->setRowWrapPolicy(QFormLayout::DontWrapRows);
     }
 
     void add_form_row(QVBoxLayout* layout, const QString& label, QWidget* widget) {
@@ -1736,8 +1920,18 @@ private:
     rendering::GraphRenderer* renderer_{nullptr};
     rendering::GraphView* view_{nullptr};
     GraphView3D* view_3d_{nullptr};
+    QWidget* central_widget_{nullptr};
+    QSplitter* main_splitter_{nullptr};
+    QWidget* left_panel_{nullptr};
+    QWidget* right_panel_{nullptr};
     QBrush bg_brush_{Qt::black};
     TitleBar* title_bar_{nullptr};
+
+    ThemeMode theme_mode_{ThemeMode::FollowSystem};
+    UiTheme active_theme_{UiTheme::Dark};
+    QAction* theme_follow_system_action_{nullptr};
+    QAction* theme_dark_action_{nullptr};
+    QAction* theme_light_action_{nullptr};
 
     QLabel* file_label_{nullptr};
     QPushButton* render_btn_{nullptr};

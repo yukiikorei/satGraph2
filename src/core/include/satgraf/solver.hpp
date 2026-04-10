@@ -145,8 +145,8 @@ public:
             ::close(STDIN_FILENO);
 
             sigset_t mask;
-            ::sigemptyset(&mask);
-            ::sigprocmask(SIG_SETMASK, &mask, nullptr);
+            sigemptyset(&mask);
+            sigprocmask(SIG_SETMASK, &mask, nullptr);
 
             int maxfd = ::sysconf(_SC_OPEN_MAX);
             for (int fd = 3; fd < maxfd; fd++) {

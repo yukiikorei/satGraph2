@@ -21,7 +21,11 @@
 #include <vector>
 
 #define CL_TARGET_OPENCL_VERSION 120
+#ifdef __APPLE__
+#include <OpenCL/opencl.h>
+#else
 #include <CL/cl.h>
+#endif
 
 namespace satgraf::layout {
 

@@ -11,6 +11,8 @@
 #include <QImage>
 #include <QIcon>
 #include <QTimer>
+#include <QStyleFactory>
+#include <QCoreApplication>
 
 #include <filesystem>
 #include <iostream>
@@ -124,7 +126,17 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    QApplication::setApplicationName("satgraf");
+    QApplication::setOrganizationName("satgraf");
+#ifdef Q_OS_MACOS
+    QApplication::setAttribute(Qt::AA_DontUseNativeMenuBar, false);
+#endif
+
     QApplication qt_app(argc, argv);
+#ifdef Q_OS_MACOS
+    qt_app.setApplicationDisplayName("satgraf");
+    qt_app.setStyle(QStyleFactory::create("macOS"));
+#endif
     qt_app.setWindowIcon(QIcon(":/satgraf/icon.png"));
     qRegisterMetaType<satgraf::community::CommunityResult>("satgraf::community::CommunityResult");
     qRegisterMetaType<satgraf::layout::CoordinateMap>("satgraf::layout::CoordinateMap");

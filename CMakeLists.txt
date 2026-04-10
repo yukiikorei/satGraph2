@@ -28,13 +28,7 @@ add_subdirectory(src/app)
 enable_testing()
 add_subdirectory(tests)
 
-# --- CPack DEB packaging ---
-install(TARGETS satgraf RUNTIME DESTINATION bin)
-install(FILES icon.png DESTINATION share/icons/hicolor/1024x1024/apps RENAME satgraf.png)
-install(FILES icon.svg DESTINATION share/icons/hicolor/scalable/apps RENAME satgraf.svg)
-install(FILES satgraf.desktop DESTINATION share/applications)
-
-set(CPACK_GENERATOR "DEB")
+# --- Shared CPack metadata ---
 set(CPACK_PACKAGE_NAME "satgraf")
 set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "SAT solver visualization tool")
@@ -45,13 +39,25 @@ Propagation), and real-time solver event tracking via external solver integratio
 set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/ekuiter/SATGraf")
 set(CPACK_PACKAGE_CONTACT "Jinghu Liang")
 set(CPACK_PACKAGE_LICENSE "MIT")
-set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Jinghu Liang")
-set(CPACK_DEBIAN_PACKAGE_SECTION "science")
-set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
-set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
-set(CPACK_DEBIAN_PACKAGE_DEPENDS
-    "libigraph3t64 (>= 0.10), libqt6core6t64 (>= 6.4), libqt6gui6t64 (>= 6.4), libqt6widgets6t64 (>= 6.4), ocl-icd-libopencl1 (>= 2.3), libstdc++6 (>= 13)")
-set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "opencl-icd")
-set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS OFF)
+
+if(APPLE)
+    set(CPACK_GENERATOR "DragNDrop")
+    set(CPACK_PACKAGE_FILE_NAME "satgraf-${PROJECT_VERSION}-macos")
+    set(CPACK_DMG_VOLUME_NAME "satgraf ${PROJECT_VERSION}")
+else()
+    install(FILES icon.png DESTINATION share/icons/hicolor/1024x1024/apps RENAME satgraf.png)
+    install(FILES icon.svg DESTINATION share/icons/hicolor/scalable/apps RENAME satgraf.svg)
+    install(FILES satgraf.desktop DESTINATION share/applications)
+
+    set(CPACK_GENERATOR "DEB")
+    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Jinghu Liang")
+    set(CPACK_DEBIAN_PACKAGE_SECTION "science")
+    set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS
+        "libigraph3t64 (>= 0.10), libqt6core6t64 (>= 6.4), libqt6gui6t64 (>= 6.4), libqt6widgets6t64 (>= 6.4), ocl-icd-libopencl1 (>= 2.3), libstdc++6 (>= 13)")
+    set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "opencl-icd")
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS OFF)
+endif()
 
 include(CPack)
