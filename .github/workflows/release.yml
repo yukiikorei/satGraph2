@@ -32,10 +32,18 @@ jobs:
 
   macos-package:
     name: macOS Package
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: ${{ runner.os }}-brew-downloads-${{ hashFiles('build_macos.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-brew-downloads-
 
       - name: Build macOS package
         run: |
