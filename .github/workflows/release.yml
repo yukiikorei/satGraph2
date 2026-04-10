@@ -1,0 +1,88 @@
+name: Release Packages
+
+on:
+  push:
+    tags:
+      - "pac.*"
+
+jobs:
+  ubuntu-package:
+    name: Ubuntu Package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Ubuntu package
+        run: |
+          chmod +x ./build_ubuntu.sh
+          ./build_ubuntu.sh
+
+      - name: Collect Ubuntu package
+        run: |
+          mkdir -p dist/ubuntu
+          find . -type f -name "*.deb" -exec cp -v {} dist/ubuntu/ \;
+
+      - name: Upload Ubuntu artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: satgraf-ubuntu-package
+          path: dist/ubuntu/*.deb
+          if-no-files-found: error
+
+  macos-package:
+    name: macOS Package
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build macOS package
+        run: |
+          chmod +x ./build_macos.sh
+          ./build_macos.sh
+
+      - name: Collect macOS package
+        run: |
+          mkdir -p dist/macos
+          find . -type f -name "*.dmg" -exec cp -v {} dist/macos/ \;
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: satgraf-macos-package
+          path: dist/macos/*.dmg
+          if-no-files-found: error
+
+  upload-release:
+    name: Upload Release Assets
+    runs-on: ubuntu-24.04
+    needs:
+      - ubuntu-package
+      - macos-package
+    permissions:
+      contents: write
+    steps:
+      - name: Download Ubuntu artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: satgraf-ubuntu-package
+          path: dist/ubuntu
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: satgraf-macos-package
+          path: dist/macos
+
+      - name: Verify release assets
+        run: |
+          ls -lah dist/ubuntu
+          ls -lah dist/macos
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ubuntu/*.deb
+            dist/macos/*.dmg

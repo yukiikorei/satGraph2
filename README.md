@@ -129,6 +129,29 @@ RUN_TESTS=0 RUN_PACKAGE=0 ./build_macos.sh
 BUILD_DIR=build-macos-debug BUILD_TYPE=Debug ./build_macos.sh
 ```
 
+### Ubuntu one-shot build/dependency setup
+
+On Ubuntu, run:
+
+```bash
+./build_ubuntu.sh
+```
+
+This script:
+- installs missing apt dependencies needed for configure/build/test/package
+- configures and builds `satgraf` in `build-ubuntu`
+- runs tests with `QT_QPA_PLATFORM=offscreen`
+- runs CPack and verifies that a `.deb` package is generated
+- runs a smoke check via `satgraf --help`
+
+Useful toggles:
+
+```bash
+RUN_TESTS=0 RUN_PACKAGE=0 ./build_ubuntu.sh
+BUILD_DIR=build-ubuntu-debug BUILD_TYPE=Debug ./build_ubuntu.sh
+BUILD_JOBS=8 ./build_ubuntu.sh
+```
+
 ### Linux compatibility regression check
 
 Use the standard Linux flow to verify non-macOS paths remain valid:
@@ -139,6 +162,10 @@ cmake --build build-linux -j$(nproc)
 ctest --test-dir build-linux --output-on-failure
 ./build-linux/src/app/satgraf --help
 ```
+
+### Release automation
+
+Pushing a Git tag that matches `pac.*` triggers GitHub Actions release packaging on both macOS and Ubuntu runners. The workflow uploads generated `.dmg` and `.deb` files as workflow artifacts and attaches them to the GitHub Release for that tag.
 
 ## Usage
 
