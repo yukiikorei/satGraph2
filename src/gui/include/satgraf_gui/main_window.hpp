@@ -153,12 +153,14 @@ public:
 #ifdef Q_OS_MACOS
         menuBar()->setNativeMenuBar(true);
         if (qApp && qApp->styleHints()) {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
             connect(qApp->styleHints(), &QStyleHints::colorSchemeChanged,
                     this, [this](Qt::ColorScheme) {
                 if (theme_mode_ == ThemeMode::FollowSystem) {
                     apply_current_theme();
                 }
             });
+#endif
         }
 #else
         menuBar()->hide();
@@ -909,21 +911,25 @@ private:
 
     UiTheme detect_system_theme() const {
 #ifdef Q_OS_MACOS
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
         if (qApp && qApp->styleHints()) {
             const auto cs = qApp->styleHints()->colorScheme();
             if (cs == Qt::ColorScheme::Light) return UiTheme::Light;
             return UiTheme::Dark;
         }
 #endif
+#endif
         return UiTheme::Dark;
     }
 
     UiTheme resolve_theme() const {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
         if (qApp && qApp->styleHints()) {
             const auto cs = qApp->styleHints()->colorScheme();
             if (cs == Qt::ColorScheme::Light) return UiTheme::Light;
             if (cs == Qt::ColorScheme::Dark) return UiTheme::Dark;
         }
+#endif
         return detect_system_theme();
     }
 
