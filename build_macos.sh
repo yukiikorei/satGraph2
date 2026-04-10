@@ -8,6 +8,8 @@ RUN_TESTS="${RUN_TESTS:-1}"
 RUN_PACKAGE="${RUN_PACKAGE:-1}"
 UPDATE_BREW="${UPDATE_BREW:-0}"
 BUILD_JOBS="${BUILD_JOBS:-}"
+MACOS_DEPLOY_QT="${MACOS_DEPLOY_QT:-1}"
+AUDIT_BUNDLE_DEPS="${AUDIT_BUNDLE_DEPS:-1}"
 
 log() {
   printf '[build_macos] %s\n' "$*"
@@ -27,6 +29,43 @@ ensure_brew_formula() {
     brew install "$formula"
   else
     log "Dependency already present: $formula"
+  fi
+}
+
+audit_bundle_dependencies() {
+  local app_bundle="$1"
+  require_cmd otool
+  require_cmd file
+
+  local -i leaked=0
+  local bin
+  while IFS= read -r bin; do
+    if ! file "${bin}" | grep -q "Mach-O"; then
+      continue
+    fi
+
+    local dep
+    while IFS= read -r dep; do
+      dep="${dep%% *}"
+      [[ -z "${dep}" ]] && continue
+
+      case "${dep}" in
+        @rpath/*|@loader_path/*|@executable_path/*|/System/*|/usr/lib/*)
+          continue
+          ;;
+      esac
+
+      # Any absolute non-system path indicates the app still depends on host libraries.
+      if [[ "${dep}" = /* ]]; then
+        log "External dependency leak: ${bin} -> ${dep}"
+        leaked=1
+      fi
+    done < <(otool -L "${bin}" | tail -n +2)
+  done < <(find "${app_bundle}" -type f)
+
+  if (( leaked != 0 )); then
+    log "Bundle contains non-system absolute library references."
+    exit 1
   fi
 }
 
@@ -88,7 +127,8 @@ main() {
   log "Configuring project in ${BUILD_DIR}..."
   cmake -S "${ROOT_DIR}" -B "${ROOT_DIR}/${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
-    -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}"
+    -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH}" \
+    -DSATGRAF_MACOS_RUN_MACDEPLOYQT="${MACOS_DEPLOY_QT}"
 
   if [[ "${RUN_TESTS}" == "1" ]]; then
     log "Building all targets (including tests)..."
@@ -136,6 +176,11 @@ main() {
     if [[ ! -d "${app_bundle}" ]]; then
       log "Expected app bundle missing: ${app_bundle}"
       exit 1
+    fi
+
+    if [[ "${AUDIT_BUNDLE_DEPS}" == "1" ]]; then
+      log "Auditing bundle dependencies for host-library leaks..."
+      audit_bundle_dependencies "${app_bundle}"
     fi
 
     log "Smoke check: app binary --help"

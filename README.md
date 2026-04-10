@@ -119,7 +119,9 @@ This script:
 - installs missing Homebrew dependencies (`igraph`, `qt`, `eigen`, `nlohmann-json`, `cli11`, `catch2`, etc.)
 - configures and builds `satgraf` in `build-macos`
 - runs tests
+- deploys Qt/runtime dependencies into `satgraf.app` during packaging
 - runs CPack and checks that a `.dmg` package contains `satgraf.app`
+- audits the bundle and fails if it still links absolute non-system host library paths
 - runs a smoke check via `satgraf.app/Contents/MacOS/satgraf --help`
 
 Useful toggles:
@@ -127,6 +129,7 @@ Useful toggles:
 ```bash
 RUN_TESTS=0 RUN_PACKAGE=0 ./build_macos.sh
 BUILD_DIR=build-macos-debug BUILD_TYPE=Debug ./build_macos.sh
+MACOS_DEPLOY_QT=0 AUDIT_BUNDLE_DEPS=0 ./build_macos.sh
 ```
 
 ### Ubuntu one-shot build/dependency setup

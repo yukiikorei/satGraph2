@@ -24,7 +24,7 @@ if(APPLE)
 
     option(SATGRAF_MACOS_RUN_MACDEPLOYQT
         "Run Qt deployment (macdeployqt) during install/package."
-        OFF)
+        ON)
     if(SATGRAF_MACOS_RUN_MACDEPLOYQT)
         if(COMMAND qt_generate_deploy_app_script)
             qt_generate_deploy_app_script(
